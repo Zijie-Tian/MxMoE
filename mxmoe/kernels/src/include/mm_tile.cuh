@@ -693,8 +693,11 @@ struct MmaInst {
     } else if constexpr (mmaM == 16 && mmaN == 8 && mmaK == 32) {
       if constexpr (std::is_same_v<T_INPUT, int8_t> && std::is_same_v<T_ACC, int32_t>) {
         mma_m16n8k32_s8s32(RC[0], RC[1], RC[2], RC[3], RA[0], RA[1], RA[2], RA[3], RB[0], RB[1]);
+#if COMPUTE_ARCH == 89
       } else if constexpr (std::is_same_v<T_INPUT, __nv_fp8_e4m3> && std::is_same_v<T_ACC, float>) {
+        // FP8 e4m3 MMA is Ada/Hopper (sm89+) only; not available on A100 sm80.
         mma_m16n8k32_e4m3fp32(RC[0], RC[1], RC[2], RC[3], RA[0], RA[1], RA[2], RA[3], RB[0], RB[1]);
+#endif
       } else {
         static_assert(mmaM != mmaM, "not supported");
       }

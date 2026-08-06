@@ -7,7 +7,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_COMPILER gcc)
 set(CMAKE_CXX_COMPILER g++)
 
-set(CMAKE_CUDA_ARCHITECTURES 89) # A100: 80
+set(CMAKE_CUDA_ARCHITECTURES 80) # A100: 80 (was 89 for RTX 4090)
 add_compile_definitions(COMPUTE_ARCH=${CMAKE_CUDA_ARCHITECTURES})
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress 128 -diag-suppress 2417, -diag-suppress 20050")
 
@@ -84,13 +84,19 @@ find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib
 # pybind11
 add_subdirectory(${CMAKE_SOURCE_DIR}/3rdparty/pybind11 pybind11)
 
-pybind11_add_module(mxmoe_ops ref_bind.cu)
-target_compile_options(mxmoe_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler -rdynamic -lineinfo --use_fast_math>) 
-target_link_libraries(mxmoe_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} fmt::fmt Python::Python)
-target_include_directories(mxmoe_ops PRIVATE 
-    ${TORCH_INCLUDE_DIRS}
-    ${Python3_INCLUDE_DIRS}
-)
+# mxmoe_ops (pybind) needs act_kernel.cuh which is not in-tree; L2 gate only needs `test`.
+# Keep the target optional so default `cmake --build build` still builds gen_lib + test on A100.
+if(EXISTS "${CMAKE_SOURCE_DIR}/include/act_kernel.cuh")
+  pybind11_add_module(mxmoe_ops ref_bind.cu)
+  target_compile_options(mxmoe_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler -rdynamic -lineinfo --use_fast_math>)
+  target_link_libraries(mxmoe_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} fmt::fmt Python::Python)
+  target_include_directories(mxmoe_ops PRIVATE
+      ${TORCH_INCLUDE_DIRS}
+      ${Python3_INCLUDE_DIRS}
+  )
+else()
+  message(WARNING "act_kernel.cuh missing — skipping mxmoe_ops pybind module (bench `test` target still builds)")
+endif()
 
 #################################################################
 # 3rdparty

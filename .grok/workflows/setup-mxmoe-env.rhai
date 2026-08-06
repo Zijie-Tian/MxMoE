@@ -385,8 +385,8 @@ report_prompt += "4. Final test target command that passed\n";
 report_prompt += "5. How to activate on this node: conda activate " + env_name + "\n";
 report_prompt += "6. Known non-goals (no flash_attn, no Gurobi license, no HF model, no bits_solver)\n";
 report_prompt += "7. Next steps for real experiments (download Qwen1.5-MoE, fix ID2NAME, optional Gurobi)\n\n";
-report_prompt += "Write the full markdown via your tools into the repo at: docs/setup-mxmoe-env-report.md\n";
-report_prompt += "(create docs/ if needed). Also return ok=true and put the file path in details.\n";
+report_prompt += "Do NOT write under repo docs/ (project AGENTS.md: no install/env reports in docs/).\n";
+report_prompt += "Return the full markdown report text in details, and ok=true. Optionally note scratch-only delivery.\n";
 
 let rep = agent(report_prompt, #{
     label: "write-report",
@@ -394,10 +394,11 @@ let rep = agent(report_prompt, #{
     output_schema: step_schema,
 });
 
-let report_path = "docs/setup-mxmoe-env-report.md";
+let report_body = "";
 if rep != () && rep.success && rep.output != () && rep.output.details != () {
-    report_path = rep.output.details;
+    report_body = rep.output.details;
 }
+let report_path = write_scratch_file("setup-mxmoe-env-report.md", report_body);
 
 let final_cmd = "python run_mxmoe_gg.py --model qwen2_moe --dataset wiki2 --bs " + batch_size.to_string() + " --layer " + layer.to_string();
 
