@@ -26,6 +26,7 @@ Project workflows are **Rhai orchestration scripts** under `.grok/workflows/`. T
 |------|------|----------------|
 | `setup-mxmoe-env` | `.grok/workflows/setup-mxmoe-env.rhai` | Create/use conda env `mxmoe`, install smoke Python deps (skip flash by default), init submodules / hadamard, arch prep, L0–L2 ending in `run_mxmoe_gg` FP16 bench |
 | `install-flash-lmeval` | `.grok/workflows/install-flash-lmeval.rhai` | Compile-install `flash_attn` and install `lm_eval` into `mxmoe`, then verify FA2 + project `Evaluator` / lm_eval |
+| `reproduce-acc` | `.grok/workflows/reproduce-acc.rhai` | **Accuracy-only** paper path for **any** `ID2NAME` MoE model: **required** `model_id` + `model_path` args; gate, gptq-had calib, ILP, Baseline + MxMoE PPL and optional zero-shot; **no** kernel/`run_mxmoe_gg` |
 
 (User-level workflows under `~/.grok/workflows/` are separate and not listed here.)
 
