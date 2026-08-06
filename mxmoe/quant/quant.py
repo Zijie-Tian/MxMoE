@@ -25,7 +25,7 @@ from mxmoe.quant.moe_utils import (
     get_linears_in_one_expert, get_linear_block_weight,
     recover_weight_from_cpu,
     substitue_moe_weights, offload_moe_weights,
-    load_hf_model, MOE_WEIGHT_NAME_MAP,
+    load_hf_model, build_max_memory, MOE_WEIGHT_NAME_MAP,
 )
 from mxmoe.kernels.qconfig import (
     QLinearConfig, QModelConfig, QLayerConfig,
@@ -730,6 +730,23 @@ if __name__ == "__main__":
     parser_eval.add_argument("--online_had", action="store_true", help="Whether to use use Hadamard transform")
     parser_eval.add_argument("--bs", type=int, default=128, help="zero-shot task eval batch")
     parser_eval.add_argument("--save", type=str, help="Save path")
+    # Single-GPU fit: accelerate device_map="auto" + max_memory (layer placement / CPU spill).
+    # Example 3090 (24GB): --max-gpu-memory 16GiB --max-cpu-memory 64GiB
+    # Keep ~8GiB free for activations: 4k-token PPL logits on a 151k vocab need ~5GiB+.
+    # Do not .to() the whole model after load. Not for calib layer_out_norm / online GPTQ.
+    parser_eval.add_argument(
+        "--max-gpu-memory", type=str, default=None,
+        help="GPU memory budget for accelerate placement (e.g. 16GiB on a 24GB 3090). "
+        "Enables CPU spill of remaining layers. Leave ~8GiB free for activations/logits.",
+    )
+    parser_eval.add_argument(
+        "--max-cpu-memory", type=str, default=None,
+        help="CPU memory budget for accelerate placement (e.g. 64GiB). Defaults to 128GiB if only --max-gpu-memory is set.",
+    )
+    parser_eval.add_argument(
+        "--offload-folder", type=str, default=None,
+        help="Directory for accelerate disk offload when modules do not fit in GPU+CPU budgets.",
+    )
 
     parser_calib = subparsers.add_parser("calib", help="Calibrate for quantized model")
     parser_calib.add_argument("--model", type=str, default="ds2", help="Model ID")
@@ -808,6 +825,7 @@ if __name__ == "__main__":
     ori_wcfg = (16,-1)
     # Calib layer_out_norm streams one decoder layer to cuda:0; keep weights on CPU so
     # qwen2_moe (~28GiB bf16) + float64 activation buffers fit on 40GB A100s.
+    # (Hand layerwise calib path; not the accelerate fit-map used by eval placement.)
     if model_id in ["qwen2_moe", "qwen2_moe_57b", "mixtral"] and args.sub == "calib":
         print(f">>> load model to CPU (calib sequential layer offload)")
         model_name = ID2NAME[model_id]
@@ -819,7 +837,35 @@ if __name__ == "__main__":
             device_map="cpu",
         )
     else:
-        model = load_hf_model(model_id)
+        # Eval (and small-model calib): optional accelerate GPU+CPU layer placement.
+        max_memory = None
+        offload_folder = None
+        if args.sub == "eval":
+            max_memory = build_max_memory(args.max_gpu_memory, args.max_cpu_memory)
+            offload_folder = args.offload_folder
+            if (max_memory is not None or offload_folder is not None) and (
+                args.qstr is not None or args.qconfig is not None or args.qweight is not None
+            ):
+                # accelerate hooks keep offloaded (CPU/disk) weights in a side map and
+                # restore them every forward, so in-place quantization / substitution on
+                # those layers is silently dropped -> mixed-precision garbage results.
+                raise SystemExit(
+                    "--max-gpu-memory/--max-cpu-memory/--offload-folder (fit-map) cannot be "
+                    "combined with --qstr/--qconfig/--qweight: in-place quantization is "
+                    "silently discarded on offloaded layers. Fit-map is for full-precision "
+                    "whole-model eval only; quantized checkpoints are smaller — load them "
+                    "without a memory budget."
+                )
+            if max_memory is not None or offload_folder is not None:
+                print(
+                    ">>> load model with accelerate placement "
+                    f"(max_memory={max_memory}, offload_folder={offload_folder})"
+                )
+        model = load_hf_model(
+            model_id,
+            max_memory=max_memory,
+            offload_folder=offload_folder,
+        )
     ############################################################################
 
     if args.sub == "eval":

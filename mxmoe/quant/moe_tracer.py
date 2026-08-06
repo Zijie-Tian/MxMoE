@@ -16,12 +16,10 @@ from functools import partial
 from torch import Tensor
 from transformers import (
     PreTrainedModel,
-    AutoTokenizer,
-    AutoModelForCausalLM,
 )
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
 from mxmoe.quant.data_utils import get_wikitext2, get_humaneval_x
-from mxmoe.quant.moe_utils import get_expert_linears
+from mxmoe.quant.moe_utils import get_expert_linears, load_hf_model, load_tokenizer, build_max_memory
 from project_config import *
 
 
@@ -451,6 +449,18 @@ if __name__ == "__main__":
     parser.add_argument("--seqlen", type=int, default=4096, help="Input length")
     parser.add_argument("--nsamples", type=int, default=32, help="Number of samples")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--max-gpu-memory", type=str, default=None,
+        help="GPU budget for accelerate layer placement (e.g. 20GiB).",
+    )
+    parser.add_argument(
+        "--max-cpu-memory", type=str, default=None,
+        help="CPU budget for accelerate layer placement (e.g. 64GiB).",
+    )
+    parser.add_argument(
+        "--offload-folder", type=str, default=None,
+        help="Disk offload folder for accelerate when GPU+CPU are insufficient.",
+    )
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--trace_input", action="store_true", help="Trace activation")
@@ -466,14 +476,11 @@ if __name__ == "__main__":
 
     ############################################################################
     figure_path = f"{CUR_DIR}/figure"
-    model_name = ID2NAME[model_id]
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map="auto",
+    tokenizer = load_tokenizer(model_id)
+    model = load_hf_model(
+        model_id,
+        max_memory=build_max_memory(args.max_gpu_memory, args.max_cpu_memory),
+        offload_folder=args.offload_folder,
     )
     ############################################################################
     tracer = MoETracer(model)

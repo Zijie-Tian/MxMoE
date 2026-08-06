@@ -22,6 +22,14 @@ class Evaluator:
 
     @torch.no_grad()
     def eval_ppl(self, model, input_len=4096):
+        """Perplexity on wikitext2.
+
+        Compatible with accelerate multi-device / GPU+CPU maps from ``load_hf_model``:
+        put inputs on ``model.device`` (entry device) and labels on the logits device.
+        NOTE: when ``lm_head`` is CPU/disk-offloaded, ``lm_head.weight.device`` is
+        ``meta`` between forwards — never move tensors to it; use ``logits.device``.
+        Do **not** call ``model.to(...)`` or move whole layers after accelerate dispatch.
+        """
         model_use_cache = model.config.use_cache
         model.config.use_cache = False
         nsamples = self.ppl_testenc.numel() // input_len
@@ -38,7 +46,7 @@ class Evaluator:
             # [bs, input_len-1, vocab_size]
             shift_logits = logits[:, :-1, :]
             # [bs, input_len-1]
-            shift_labels = batch[:, 1:].to(model.lm_head.weight.device)
+            shift_labels = batch[:, 1:].to(logits.device)
             loss = loss_fct(
                 # [bs * (input_len-1), vocab_size]
                 shift_logits.view(-1, shift_logits.size(-1)),

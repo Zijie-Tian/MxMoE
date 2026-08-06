@@ -47,6 +47,33 @@ Every new workflow **must state its purpose clearly** before implementation is c
 
 When editing an existing workflow, keep `description` / `when_to_use` / header in sync with behavior changes.
 
+## Single-GPU layer placement ("PP test", accelerate fit-map)
+
+Load a MoE model that does **not** fit in one GPU (e.g. Qwen1.5-MoE-A2.7B bf16 ≈ 28.6GiB on a 24GB RTX 3090) for whole-model accuracy eval. Placement is done **only** by accelerate (`load_checkpoint_and_dispatch` + `device_map="auto"` + `max_memory`, optional `offload_folder` for disk spill) — no hand-written CPU↔GPU layer scheduler, no real pipeline parallelism (no pippy/microbatch/`torch.distributed`).
+
+**Implementation** (all in `mxmoe/quant/moe_utils.py`):
+
+- `build_max_memory(gpu_limit, cpu_limit)` → `max_memory` dict; GPU-only ⇒ CPU defaults to `128GiB` spill.
+- `resolve_device_map(model_id, device_map, max_memory)` → explicit map wins; `max_memory` set ⇒ force `"auto"`; else legacy multi-GPU hand maps from `get_device_map`.
+- `load_hf_model(..., max_memory=..., offload_folder=...)` → dispatches and prints the resulting `hf_device_map`. `no_split_module_classes` must be class **names** (accelerate compares `__class__.__name__`; passing classes silently disables it and splits layers mid-expert).
+
+**Usage**:
+
+```bash
+# Full-precision PPL on one 3090 (keep ~8GiB free: 4k-token logits on the 151k vocab need ~5GiB)
+CUDA_VISIBLE_DEVICES=0 python -m mxmoe.quant.quant eval --model qwen2_moe --method rtn \
+    --tasks ppl --max-gpu-memory 16GiB --max-cpu-memory 64GiB
+# Gate tracing with the same placement flags
+CUDA_VISIBLE_DEVICES=0 python -m mxmoe.quant.moe_tracer --model qwen2_moe --trace_gate \
+    --max-gpu-memory 8GiB --max-cpu-memory 64GiB [--offload-folder DIR]
+```
+
+**Rules / gotchas**:
+
+- Never `.to()` the whole model or single layers after dispatch; hooks restore offloaded weights every forward. Offloaded modules sit on `meta` between forwards — read devices from runtime tensors (e.g. `logits.device`), never from `lm_head.weight.device`.
+- Fit-map is **full-precision eval only**: it is rejected (SystemExit) together with `--qstr/--qconfig/--qweight`, because in-place quantization on offloaded layers is silently dropped. Calib `layer_out_norm` / online GPTQ keep their own CPU + per-layer path and do not use fit-map.
+- Verified: `qwen2_moe` FP16 wikitext2 PPL = 6.79 (73×4096, ~5.2s/sample) on a single 3090 with `16GiB` GPU budget.
+
 ## Related conventions
 
 - Prefer minimal, necessary source diffs; keep generated kernels/build trees out of git (see `.gitignore`).

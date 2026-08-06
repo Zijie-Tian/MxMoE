@@ -225,6 +225,8 @@ def get_linears_in_one_expert(expert: nn.Module) -> dict[str, nn.Linear]:
 
 
 def get_device_map(model_id: str):
+    """Multi-GPU hand maps for known large models; otherwise ``\"auto\"``."""
+    device_map = "auto"
     if torch.cuda.device_count() == 2:
         if model_id == "qwen2_moe_57b":
             device_map = {
@@ -273,12 +275,85 @@ def get_device_map(model_id: str):
                 "model.norm": "cuda:3",
                 "lm_head": 3,
             }
-    else:
-        device_map = "auto"
 
     return device_map
 
-def load_hf_model(model_id: str, ckpt=None, rotation=False, dtype="auto"):
+
+def build_max_memory(
+    gpu_limit: str | None = None,
+    cpu_limit: str | None = None,
+    gpu_id: int = 0,
+) -> dict[int | str, str] | None:
+    """Build ``max_memory`` for accelerate ``load_checkpoint_and_dispatch``.
+
+    Used for single-GPU layer placement with CPU (and optional disk) spill when
+    the full model does not fit in VRAM. Placement is performed by accelerate
+    via ``device_map=\"auto\"`` + this budget — not by hand-written layer moves.
+
+    Args:
+        gpu_limit: e.g. ``\"16GiB\"`` for GPU ``gpu_id``. Keep enough VRAM free for
+            activations — 4k-token PPL logits on a 151k vocab need ~5GiB, so budget
+            ~16GiB on a 24GB RTX 3090 rather than 20GiB+.
+        cpu_limit: e.g. ``\"64GiB\"``. If only ``gpu_limit`` is set, defaults to ``\"128GiB\"``.
+        gpu_id: physical/logical GPU index key expected by accelerate (usually 0).
+
+    Returns:
+        ``None`` if neither limit is provided (caller uses default device_map only).
+    """
+    if gpu_limit is None and cpu_limit is None:
+        return None
+
+    max_memory: dict[int | str, str] = {}
+    if gpu_limit is not None:
+        max_memory[gpu_id] = gpu_limit
+    if cpu_limit is not None:
+        max_memory["cpu"] = cpu_limit
+    elif gpu_limit is not None:
+        # Allow remaining modules to spill to host RAM.
+        max_memory["cpu"] = "128GiB"
+    return max_memory
+
+
+def resolve_device_map(
+    model_id: str,
+    device_map: str | dict | None = None,
+    max_memory: dict | None = None,
+):
+    """Choose device_map for accelerate dispatch.
+
+    When ``max_memory`` is set (single-GPU fit), force ``\"auto\"`` so accelerate
+    places whole modules under the budget. Otherwise keep multi-GPU hand maps.
+    """
+    if device_map is not None:
+        return device_map
+    if max_memory is not None:
+        return "auto"
+    return get_device_map(model_id)
+
+
+def load_hf_model(
+    model_id: str,
+    ckpt=None,
+    rotation=False,
+    dtype="auto",
+    *,
+    device_map: str | dict | None = None,
+    max_memory: dict | None = None,
+    offload_folder: str | None = None,
+    offload_buffers: bool = False,
+):
+    """Load a HF causal LM with accelerate layer placement.
+
+    Single-GPU OOM mitigation: pass ``max_memory`` from :func:`build_max_memory`
+    (and optionally ``offload_folder`` for disk spill). Do **not** ``.to()`` the
+    whole model or individual layers after load — that breaks the map.
+
+    Note: calib ``layer_out_norm`` / online GPTQ hand layerwise paths are out of
+    scope for this placement mode; they still use their own CPU + per-layer logic.
+    In-place weight edits (RTN fake-quant, ``substitue_moe_weights``) on
+    CPU/disk-offloaded layers are silently dropped: accelerate hooks restore the
+    original weights from their side map at every forward.
+    """
     from project_config import ID2NAME
     from transformers import AutoModelForCausalLM, AutoConfig
     from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
@@ -286,7 +361,6 @@ def load_hf_model(model_id: str, ckpt=None, rotation=False, dtype="auto"):
 
     from accelerate import load_checkpoint_and_dispatch, init_empty_weights
     from mxmoe.quant.rotation import fuse_layer_norms
-
 
     model_name = ID2NAME[model_id]
 
@@ -303,16 +377,42 @@ def load_hf_model(model_id: str, ckpt=None, rotation=False, dtype="auto"):
         print("Fusing Layer norm ...")
         fuse_layer_norms(model)
 
+    resolved_map = resolve_device_map(model_id, device_map=device_map, max_memory=max_memory)
     ckpt = ckpt if ckpt is not None else model_name
-    model = load_checkpoint_and_dispatch(
-        model,
+
+    dispatch_kwargs = dict(
+        model=model,
         checkpoint=ckpt,
-        device_map = get_device_map(model_id),
+        device_map=resolved_map,
+        # accelerate compares class *names* (str) here; passing classes silently
+        # disables no_split and lets decoder layers be split mid-expert.
         no_split_module_classes=[
-            MixtralDecoderLayer,
-            Qwen2MoeDecoderLayer,
+            MixtralDecoderLayer.__name__,
+            Qwen2MoeDecoderLayer.__name__,
         ],
+        offload_buffers=offload_buffers,
     )
+    if max_memory is not None:
+        dispatch_kwargs["max_memory"] = max_memory
+    if offload_folder is not None:
+        dispatch_kwargs["offload_folder"] = offload_folder
+
+    if max_memory is not None or offload_folder is not None:
+        print(
+            f"[load_hf_model] accelerate placement: device_map={resolved_map!r}, "
+            f"max_memory={max_memory}, offload_folder={offload_folder}"
+        )
+
+    model = load_checkpoint_and_dispatch(**dispatch_kwargs)
+
+    hf_map = getattr(model, "hf_device_map", None)
+    if hf_map is not None:
+        # Summarize placement without dumping every key twice.
+        from collections import Counter
+        counts = Counter(str(v) for v in hf_map.values())
+        print(f"[load_hf_model] hf_device_map device counts: {dict(counts)}")
+        print(f"[load_hf_model] hf_device_map: {hf_map}")
+
     return model
 
 
