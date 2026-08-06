@@ -1,18 +1,89 @@
+import glob
 import os
+import sys
+
+from dotenv import load_dotenv
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 CALIB_DIR = f"{CUR_DIR}/calib"
 
-ID2NAME = {
-    # "ds2": "deepseek-ai/DeepSeek-V2-Lite",
-    # "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "ds2": "/data/duanmuhaojie/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots/604d5664dddd88a0433dbae533b7fe9472482de0",
-    "mixtral": "/data/duanmuhaojie/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/41bd4c9e7e4fb318ca40e721131d4933966c2cc1",
-    # "qwen2_moe": "/data/duanmuhaojie/.cache/huggingface/hub/models--Qwen--Qwen1.5-MoE-A2.7B/snapshots/1a758c50ecb6350748b9ce0a99d2352fd9fc11c9",
-    # "qwen2_moe": "/mnt/data/yjw/workspace/models/Qwen1.5-MoE-A2.7B",
-    "qwen2_moe": os.path.expanduser("~/models/Qwen1.5-MoE-A2.7B"),
-    "qwen2_moe_57b": "/data/duanmuhaojie/.cache/huggingface/hub/models--Qwen--Qwen2-57B-A14B-Instruct/snapshots/50896d66b39f1425d63720541a66c7df13e053c0",
+# Machine-local model checkpoint paths live in <repo>/.env (gitignored; see .env.example).
+# Precedence: process environment > .env. There are NO built-in defaults on purpose:
+# an unconfigured model id fails loudly below instead of silently downloading from the Hub.
+load_dotenv(os.path.join(CUR_DIR, ".env"), override=False)
+
+MODEL_ID2ENV = {
+    "ds2": "MXMOE_MODEL_DS2",
+    "mixtral": "MXMOE_MODEL_MIXTRAL",
+    "qwen2_moe": "MXMOE_MODEL_QWEN2_MOE",
+    "qwen2_moe_57b": "MXMOE_MODEL_QWEN2_MOE_57B",
 }
+
+
+class _ModelPaths(dict):
+    """ID2NAME that tells the operator how to fix an unconfigured model id."""
+
+    def __missing__(self, model_id: str):
+        env_key = MODEL_ID2ENV.get(model_id)
+        if env_key is None:
+            raise KeyError(
+                f"Unknown model id '{model_id}'. Known ids: {sorted(MODEL_ID2ENV)}"
+            )
+        raise KeyError(
+            f"Model '{model_id}' is not configured: set {env_key}=/path/to/checkpoint "
+            f"in {CUR_DIR}/.env (see .env.example) or in the process environment, "
+            f"then run `python project_config.py --check {model_id}`."
+        )
+
+
+ID2NAME = _ModelPaths(
+    (model_id, os.path.expanduser(os.environ[env_key]))
+    for model_id, env_key in MODEL_ID2ENV.items()
+    if os.environ.get(env_key)
+)
+
+
+def check_model_paths(model_ids: list[str] | None = None) -> bool:
+    """Report model path resolution. Requested ids must be set AND valid.
+
+    Without arguments: report all known ids; unset ids are warnings, invalid
+    configured paths are failures.
+    """
+    requested = model_ids is not None and len(model_ids) > 0
+    ids = model_ids if requested else list(MODEL_ID2ENV)
+    ok = True
+    for model_id in ids:
+        env_key = MODEL_ID2ENV.get(model_id)
+        if env_key is None:
+            print(f"[FAIL] {model_id}: unknown model id (known: {sorted(MODEL_ID2ENV)})")
+            ok = False
+            continue
+        raw = os.environ.get(env_key)
+        if not raw:
+            level = "FAIL" if requested else "unset"
+            if requested:
+                ok = False
+            print(f"[{level}] {model_id}: {env_key} not set (process env or {CUR_DIR}/.env)")
+            continue
+        path = os.path.expanduser(raw)
+        has_config = os.path.isfile(os.path.join(path, "config.json"))
+        has_weights = bool(
+            glob.glob(os.path.join(path, "*.safetensors"))
+            or glob.glob(os.path.join(path, "*.bin"))
+        )
+        valid = has_config and has_weights
+        if not valid:
+            ok = False
+        print(
+            f"[{'OK' if valid else 'FAIL'}] {model_id}: {path} "
+            f"(config.json={has_config}, weights={has_weights})"
+        )
+    return ok
+
+
+if __name__ == "__main__":
+    argv = [a for a in sys.argv[1:] if a != "--check"]
+    sys.exit(0 if check_model_paths(argv or None) else 1)
 
 EXPERT_QUANT_LOSS = {
     "rtn": {

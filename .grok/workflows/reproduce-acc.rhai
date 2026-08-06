@@ -43,7 +43,7 @@ let meta = #{
     when_to_use: "When you need Table-1 style PPL/zero-shot for any ID2NAME MoE model and should utilize multiple GPUs in parallel",
     phases: [
         #{ title: "Precheck", detail: "env, multi-GPU visible, flash_attn, lm_eval, model path" },
-        #{ title: "Model-Path", detail: "ID2NAME[model_id] -> model_path" },
+        #{ title: "Model-Path", detail: ".env MXMOE_MODEL_<ID> = model_path" },
         #{ title: "Gate-Trace", detail: "real moe-gate on gpu_a" },
         #{ title: "Parallel-Calib", detail: "filter_a@gpu_a || filter_b@gpu_b (|| baseline@gpu_c)" },
         #{ title: "Align-Loss", detail: "calib paths match EXPERT_QUANT_LOSS" },
@@ -195,10 +195,12 @@ phase("Model-Path");
 if skip_model_path {
     log("skip_model_path=true");
 } else {
+    let env_key = "MXMOE_MODEL_" + model_id.to_upper();
     let mp = "";
-    mp += "Set project_config.ID2NAME[\"" + model_id + "\"] = \"" + model_path + "\"\n";
+    mp += "Configure the model checkpoint path via the gitignored .env (NEVER edit tracked project_config.py).\n";
+    mp += "Repo-root .env: copy from .env.example if missing; set or update the single line " + env_key + "=" + model_path + " (idempotent, keep other keys).\n";
     mp += preamble;
-    mp += "Verify print + tokenizer load. ok=true if path matches.\n";
+    mp += "Then run: python project_config.py --check " + model_id + " and verify tokenizer loads. ok=true only if the check exits 0.\n";
     let mpr = agent(mp, #{
         label: "model-path",
         capability_mode: "all",

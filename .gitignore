@@ -30,3 +30,4 @@ log/*
 calib/*
 calib_bkp/*
 qconfigs/*
+/.env

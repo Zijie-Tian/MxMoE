@@ -7,6 +7,18 @@
 - **`docs/` is reserved for documenting intentional source/code changes** (design notes for code, API behavior changes, algorithm/kernel modifications, PR-oriented change logs). Prefer short, code-linked notes over install diaries.
 - Do not create files such as `docs/setup-*-report.md`, `docs/install-*-report.md`, or similar environment reports under this repo.
 
+## Machine-local config (`.env`) — MANDATORY
+
+Model checkpoint paths are **machine-local** and live in the **gitignored** `<repo>/.env` — never in tracked files. `project_config.py` loads it via python-dotenv (process env > `.env`; **no built-in defaults** — an unconfigured model id raises a helpful `KeyError`).
+
+**Before running anything that loads model weights, an agent MUST:**
+
+1. Ensure `.env` exists (else `cp .env.example .env` and fill in this node's paths; values may use `~`).
+2. Run `python project_config.py --check <model_id>` and proceed only on exit 0. Report-all mode: `python project_config.py --check`.
+3. Never commit machine-local absolute paths — to `project_config.py`, docs, or anywhere tracked. Node-specific paths go to `.env` only.
+
+Keys: `MXMOE_MODEL_DS2`, `MXMOE_MODEL_MIXTRAL`, `MXMOE_MODEL_QWEN2_MOE`, `MXMOE_MODEL_QWEN2_MOE_57B` (mapping: `MODEL_ID2ENV` in `project_config.py`). Adding a new model id ⇒ extend `MODEL_ID2ENV` + `.env.example` + this list. Requires `python-dotenv` in the `mxmoe` env.
+
 ## Workflows (`.grok/workflows/`)
 
 Project workflows are **Rhai orchestration scripts** under `.grok/workflows/`. They automate multi-step agent pipelines for this repo (env bring-up, optional package compile, smoke verification, later experiment stages). They are **not** part of the scientific code path; they exist so setup and repeatable checks can run in the background with a clear phase rail.

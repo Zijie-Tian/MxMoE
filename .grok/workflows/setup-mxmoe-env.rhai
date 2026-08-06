@@ -256,7 +256,7 @@ prep_prompt += "  num_shared_experts=4, num_tokens=4096,\n";
 prep_prompt += "  layer-" + layer.to_string() + " with access_freq length 60 positive ints summing >0,\n";
 prep_prompt += "  weights_sum length 60 floats, percentile_stats={}.\n";
 prep_prompt += "Also ensure MODEL_ID_TO_TRACE_FILE path exists (gen_workload defaults).\n\n";
-prep_prompt += "### F) Do NOT change project_config model paths unless needed for L2 (L2 should not load HF weights).\n";
+prep_prompt += "### F) Model paths live in the gitignored repo-root .env (MXMOE_MODEL_* keys; see .env.example). Do NOT edit tracked project_config.py; L2 should not load HF weights, so .env model keys are not required here.\n";
 prep_prompt += "Do NOT download models.\n\n";
 prep_prompt += "Return ok=true only if submodules ok, hadamard imports, arch patch applied (or already correct for 89), and gate json exists.\n";
 
@@ -384,7 +384,7 @@ report_prompt += "3. Verification results (L0/L1/L2)\n";
 report_prompt += "4. Final test target command that passed\n";
 report_prompt += "5. How to activate on this node: conda activate " + env_name + "\n";
 report_prompt += "6. Known non-goals (no flash_attn, no Gurobi license, no HF model, no bits_solver)\n";
-report_prompt += "7. Next steps for real experiments (download Qwen1.5-MoE, fix ID2NAME, optional Gurobi)\n\n";
+report_prompt += "7. Next steps for real experiments (download Qwen1.5-MoE, set MXMOE_MODEL_QWEN2_MOE in .env, optional Gurobi)\n\n";
 report_prompt += "Do NOT write under repo docs/ (project AGENTS.md: no install/env reports in docs/).\n";
 report_prompt += "Return the full markdown report text in details, and ok=true. Optionally note scratch-only delivery.\n";
 
