@@ -9,7 +9,7 @@ ID2NAME = {
     "ds2": "/data/duanmuhaojie/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots/604d5664dddd88a0433dbae533b7fe9472482de0",
     "mixtral": "/data/duanmuhaojie/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/41bd4c9e7e4fb318ca40e721131d4933966c2cc1",
     # "qwen2_moe": "/data/duanmuhaojie/.cache/huggingface/hub/models--Qwen--Qwen1.5-MoE-A2.7B/snapshots/1a758c50ecb6350748b9ce0a99d2352fd9fc11c9",
-    "qwen2_moe": "/root/workspace/models/Qwen1.5-MoE-A2.7B",
+    "qwen2_moe": "/mnt/data/yjw/workspace/models/Qwen1.5-MoE-A2.7B",
     "qwen2_moe_57b": "/data/duanmuhaojie/.cache/huggingface/hub/models--Qwen--Qwen2-57B-A14B-Instruct/snapshots/50896d66b39f1425d63720541a66c7df13e053c0",
 }
 

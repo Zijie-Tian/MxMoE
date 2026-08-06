@@ -1,52 +1,55 @@
 // reproduce-acc: Generic MxMoE paper accuracy pipeline (PPL + optional
-// zero-shot). Model is a REQUIRED parameter (model_id + model_path) — not
-// hard-coded to any single checkpoint. Scope excludes kernel / run_mxmoe_gg /
-// Fig.5. Pipeline: ID2NAME → real gate → gptq-had calib → bits_solver →
-// Baseline + MxMoE eval. Side effects: calib/, qconfigs/, data/cache/, GPU.
-// Reports: workflow scratch only — never docs/ (see AGENTS.md).
+// zero-shot). Model is REQUIRED (model_id + model_path). NO kernel/run_mxmoe_gg.
+//
+// MULTI-GPU: pin each heavy job to ONE physical GPU (do not share
+// CUDA_VISIBLE_DEVICES across concurrent full-model loads). Default layout for
+// three cards gpu_a/b/c (e.g. 1/2/3):
+//   - Gate: gpu_a
+//   - Parallel after gate: calib filter_a @ gpu_a | calib filter_b @ gpu_b |
+//     baseline eval @ gpu_c (if run and gpu_c set)
+//   - Align + Solver: CPU (any)
+//   - Parallel after solver: MxMoE eval @ gpu_a | optional uniform @ gpu_b
+//
+// Side effects: calib/, qconfigs/, data/cache/, GPU. Reports: scratch only.
 //
 // Required args:
-//   model_id          project_config ID2NAME key (e.g. "qwen2_moe", "ds2", "mixtral")
-//   model_path        absolute local weights directory for that model
+//   model_id, model_path
 //
 // Optional args:
 //   env_name          default "mxmoe"
-//   gpu_devices       default "2,3"
+//   gpu_a             default "1"   (single-GPU pin for job A)
+//   gpu_b             default "2"
+//   gpu_c             default "3"   (empty string disables 3-way baseline||calib)
+//   gpu_devices       default "1,2,3"  (documentation / precheck visibility)
 //   cuda_home         default "/usr/local/cuda-12.4"
 //   nsamples          default "128"
 //   seqlen            default "4096"
-//   dataset           default "wiki2"   (gate/calib dataset id used by tracer)
+//   dataset           default "wiki2"
 //   qtype             default "gptq-had"
-//   filter_a          default "w4a4_g-1_sym"   (first solver/calib scheme)
-//   filter_b          default "w8a8_g-1_sym"   (second scheme)
+//   filter_a          default "w4a4_g-1_sym"
+//   filter_b          default "w8a8_g-1_sym"
 //   wbits             default "5.0"
 //   r                 default "0.75"
 //   solver_batch      default "8192"
 //   run_zeroshot      default true
 //   run_uniform_w4a4  default false
-//   paper_note        default ""  (optional human note / paper refs for report)
-//   skip_model_path   default false
-//   skip_gate         default false
-//   skip_calib        default false
-//   skip_solver       default false
-//   skip_baseline     default false
-//   skip_mxmoe_eval   default false
+//   paper_note        default ""
+//   skip_model_path / skip_gate / skip_calib / skip_solver /
+//   skip_baseline / skip_mxmoe_eval  default false
 //
 let meta = #{
     name: "reproduce-acc",
-    description: "Generic MoE accuracy reproduction: parameterized model_id/path, gate, gptq-had calib, ILP, Baseline+MxMoE PPL and optional zero-shot (no kernel)",
-    when_to_use: "When you need Table-1 style PPL/zero-shot for any supported ID2NAME MoE model, with model_id and model_path passed as args",
+    description: "Multi-GPU MoE accuracy reproduction: model_id/path args; parallel calib on separate GPUs; Baseline+MxMoE PPL/ZS (no kernel)",
+    when_to_use: "When you need Table-1 style PPL/zero-shot for any ID2NAME MoE model and should utilize multiple GPUs in parallel",
     phases: [
-        #{ title: "Precheck", detail: "env, GPU, flash_attn, lm_eval, model path exists" },
-        #{ title: "Model-Path", detail: "point project_config.ID2NAME[model_id] at model_path" },
-        #{ title: "Gate-Trace", detail: "real moe-gate on dataset" },
-        #{ title: "Calib", detail: "gptq-had layer_out_norm for filter_a and filter_b" },
-        #{ title: "Align-Loss", detail: "calib JSON paths match EXPERT_QUANT_LOSS" },
-        #{ title: "Solver", detail: "bits_solver mixed qconfig + tile_cfg" },
-        #{ title: "Eval-Baseline", detail: "baseline PPL (+ zero-shot)" },
-        #{ title: "Eval-MxMoE", detail: "MxMoE mixed qconfig PPL (+ zero-shot)" },
-        #{ title: "Eval-Optional", detail: "optional uniform filter_a control" },
-        #{ title: "Report", detail: "scratch summary (no docs/)" },
+        #{ title: "Precheck", detail: "env, multi-GPU visible, flash_attn, lm_eval, model path" },
+        #{ title: "Model-Path", detail: "ID2NAME[model_id] -> model_path" },
+        #{ title: "Gate-Trace", detail: "real moe-gate on gpu_a" },
+        #{ title: "Parallel-Calib", detail: "filter_a@gpu_a || filter_b@gpu_b (|| baseline@gpu_c)" },
+        #{ title: "Align-Loss", detail: "calib paths match EXPERT_QUANT_LOSS" },
+        #{ title: "Solver", detail: "bits_solver ILP (CPU)" },
+        #{ title: "Parallel-Eval", detail: "MxMoE@gpu_a || optional uniform@gpu_b; baseline if not earlier" },
+        #{ title: "Report", detail: "scratch summary only" },
     ],
 };
 
@@ -71,9 +74,8 @@ fn arg_bool(a, key, default_val) {
     default_val
 }
 
-// Required: model_id + model_path (no hard-coded model defaults)
 if args == () {
-    pause("infra", "Pass args.model_id and args.model_path (required). Example: model_id=qwen2_moe, model_path=/path/to/weights");
+    pause("infra", "Pass args.model_id and args.model_path (required).");
 }
 let model_id_raw = args.model_id;
 let model_path_raw = args.model_path;
@@ -87,7 +89,10 @@ let model_id = model_id_raw;
 let model_path = model_path_raw;
 
 let env_name = arg_str(args, "env_name", "mxmoe");
-let gpu_devices = arg_str(args, "gpu_devices", "2,3");
+let gpu_a = arg_str(args, "gpu_a", "1");
+let gpu_b = arg_str(args, "gpu_b", "2");
+let gpu_c = arg_str(args, "gpu_c", "3");
+let gpu_devices = arg_str(args, "gpu_devices", "1,2,3");
 let cuda_home = arg_str(args, "cuda_home", "/usr/local/cuda-12.4");
 let nsamples = arg_str(args, "nsamples", "128");
 let seqlen = arg_str(args, "seqlen", "4096");
@@ -107,6 +112,9 @@ let skip_calib = arg_bool(args, "skip_calib", false);
 let skip_solver = arg_bool(args, "skip_solver", false);
 let skip_baseline = arg_bool(args, "skip_baseline", false);
 let skip_mxmoe_eval = arg_bool(args, "skip_mxmoe_eval", false);
+
+// Whether to fan baseline into the calib parallel panel (needs a distinct gpu_c)
+let baseline_with_calib = !skip_baseline && gpu_c != "" && gpu_c != gpu_a && gpu_c != gpu_b;
 
 let step_schema = #{
     "type": "object",
@@ -134,34 +142,38 @@ let eval_schema = #{
     },
 };
 
+// Base env (no multi-GPU export — each job pins one id)
 let preamble = "";
-preamble += "Always use isolated conda env `" + env_name + "` (not base/kitty).\n";
+preamble += "Use isolated conda env `" + env_name + "` only.\n";
 preamble += "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate " + env_name + "\n";
-preamble += "export CUDA_VISIBLE_DEVICES=" + gpu_devices + "\n";
 preamble += "export CUDA_HOME=" + cuda_home + "\n";
 preamble += "export PATH=$CUDA_HOME/bin:$PATH\n";
 preamble += "export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}\n";
-preamble += "cd to MxMoE repo root (git rev-parse --show-toplevel).\n";
-preamble += "export PYTHONPATH=$PWD:$PYTHONPATH\n";
-preamble += "Confirm: which python is .../envs/" + env_name + "/bin/python\n";
-preamble += "Target model_id=" + model_id + " model_path=" + model_path + "\n";
+preamble += "cd MxMoE repo root (git rev-parse --show-toplevel); export PYTHONPATH=$PWD:$PYTHONPATH\n";
+preamble += "CRITICAL multi-GPU rule: set CUDA_VISIBLE_DEVICES to EXACTLY ONE physical GPU id for this job.\n";
+preamble += "Do NOT export CUDA_VISIBLE_DEVICES=" + gpu_devices + " for concurrent full-model jobs.\n";
+preamble += "model_id=" + model_id + " model_path=" + model_path + "\n";
+
+let zs_tasks = "arc_challenge arc_easy hellaswag lambada_openai lambada_standard piqa winogrande";
+let task_args = "ppl";
+if run_zeroshot {
+    task_args = "ppl " + zs_tasks;
+}
 
 // =============================================================================
 phase("Precheck");
 // =============================================================================
 
 let pre_p = "";
-pre_p += "Precheck for MxMoE accuracy reproduction (PPL + optional zero-shot; NO kernel bench).\n";
+pre_p += "Precheck multi-GPU accuracy pipeline (PPL/ZS; no kernel).\n";
 pre_p += preamble;
-pre_p += "\nRun shell checks (do not guess):\n";
-pre_p += "1) conda env " + env_name + " exists; torch.cuda.is_available()\n";
-pre_p += "2) import flash_attn; transformers.utils.is_flash_attn_2_available()\n";
-pre_p += "3) import lm_eval; from mxmoe.quant.evaluator import Evaluator\n";
-pre_p += "4) test -d \"" + model_path + "\" and list config/weights under it\n";
-pre_p += "5) project_config.ID2NAME must eventually support key \"" + model_id + "\" (exists in dict after Model-Path step)\n";
-pre_p += "6) gurobipy import works (needed for bits_solver)\n";
-pre_p += "7) df -h . (warn if free < 50GB)\n\n";
-pre_p += "ok=true only if env+torch+cuda+model_dir+flash_attn+lm_eval OK.\n";
+pre_p += "Pins: gpu_a=" + gpu_a + " gpu_b=" + gpu_b + " gpu_c=" + gpu_c + " list=" + gpu_devices + "\n";
+pre_p += "1) conda env " + env_name + "; torch cuda\n";
+pre_p += "2) flash_attn + is_flash_attn_2_available; lm_eval; Evaluator\n";
+pre_p += "3) model_path exists with weights\n";
+pre_p += "4) nvidia-smi shows GPUs " + gpu_a + "," + gpu_b + "," + gpu_c + " free enough (~>30GB free each preferred)\n";
+pre_p += "5) gurobipy import OK\n";
+pre_p += "ok=true only if env+model+GPUs OK.\n";
 
 let pre = agent(pre_p, #{
     label: "precheck",
@@ -181,20 +193,12 @@ phase("Model-Path");
 // =============================================================================
 
 if skip_model_path {
-    log("skip_model_path=true — ID2NAME[\"" + model_id + "\"] must already point at " + model_path);
+    log("skip_model_path=true");
 } else {
     let mp = "";
-    mp += "Update project_config.py ID2NAME for the parameterized model.\n";
+    mp += "Set project_config.ID2NAME[\"" + model_id + "\"] = \"" + model_path + "\"\n";
     mp += preamble;
-    mp += "Set ID2NAME[\"" + model_id + "\"] = \"" + model_path + "\"\n";
-    mp += "Steps:\n";
-    mp += "1) Read project_config.py\n";
-    mp += "2) If key missing, add it; if present, replace path only for this key\n";
-    mp += "3) Do not change other model entries unless required for syntax\n";
-    mp += "4) python -c \"from project_config import ID2NAME; print(ID2NAME['" + model_id + "'])\"\n";
-    mp += "5) Prefer: AutoTokenizer.from_pretrained(that path, trust_remote_code=True)\n\n";
-    mp += "ok=true only if printed path matches model_path and load succeeds (or path exists if load too heavy — prefer tokenizer load).\n";
-
+    mp += "Verify print + tokenizer load. ok=true if path matches.\n";
     let mpr = agent(mp, #{
         label: "model-path",
         capability_mode: "all",
@@ -215,19 +219,16 @@ phase("Gate-Trace");
 // =============================================================================
 
 if skip_gate {
-    log("skip_gate=true — expect calib/gate/" + model_id + "/" + dataset + "/" + seqlen + "/moe-gate.json");
+    log("skip_gate=true");
 } else {
     let gp = "";
-    gp += "Collect REAL MoE gate trace for model_id=" + model_id + ".\n";
+    gp += "REAL MoE gate trace on SINGLE GPU " + gpu_a + ".\n";
     gp += preamble;
-    gp += "Command:\n";
-    gp += "python -m mxmoe.quant.moe_tracer \\\n";
-    gp += "  --model " + model_id + " --trace_gate --dataset " + dataset + " \\\n";
-    gp += "  --seqlen " + seqlen + " --nsamples " + nsamples + "\n\n";
-    gp += "Wait for full model load + exit 0.\n";
-    gp += "Pass: calib/gate/" + model_id + "/" + dataset + "/" + seqlen + "/moe-gate.json exists with access_freq.\n";
-    gp += "ok=true only if pass. artifact_path = json path.\n";
-
+    gp += "export CUDA_VISIBLE_DEVICES=" + gpu_a + "\n";
+    gp += "python -m mxmoe.quant.moe_tracer --model " + model_id + " --trace_gate \\\n";
+    gp += "  --dataset " + dataset + " --seqlen " + seqlen + " --nsamples " + nsamples + "\n";
+    gp += "Pass: calib/gate/" + model_id + "/" + dataset + "/" + seqlen + "/moe-gate.json with access_freq.\n";
+    gp += "ok=true only if pass. artifact_path=json.\n";
     let gr = agent(gp, #{
         label: "gate-trace",
         capability_mode: "all",
@@ -244,58 +245,116 @@ if skip_gate {
 }
 
 // =============================================================================
-phase("Calib");
+phase("Parallel-Calib");
 // =============================================================================
 
-if skip_calib {
-    log("skip_calib=true");
+let base_eval = ();
+let c1_out = ();
+let c2_out = ();
+
+if skip_calib && (skip_baseline || !baseline_with_calib) {
+    log("skip_calib and no baseline-with-calib panel");
 } else {
-    let c1p = "";
-    c1p += "Quant-loss calibration for scheme filter_a=" + filter_a + " model=" + model_id + ".\n";
-    c1p += preamble;
-    c1p += "python -m mxmoe.quant.quant calib \\\n";
-    c1p += "  --model " + model_id + " --method " + qtype + " \\\n";
-    c1p += "  --metric layer_out_norm --qcfg " + filter_a + " \\\n";
-    c1p += "  --nsamples " + nsamples + "\n\n";
-    c1p += "Long GPU job. ok=true if *layer_out_norm*.json for this scheme appears under calib/.\n";
-    c1p += "artifact_path = exact output path.\n";
+    let jobs = [];
 
-    let c1 = agent(c1p, #{
-        label: "calib-a",
-        capability_mode: "all",
-        output_schema: step_schema,
-    });
-    if c1 == () || !c1.success || c1.output == () || c1.output.ok != true {
-        let d = "calib filter_a failed";
-        if c1 != () && c1.success && c1.output != () {
-            d = c1.output.summary + " | " + c1.output.details;
-        }
-        pause("infra", d);
+    if !skip_calib {
+        let c1p = "";
+        c1p += "MULTI-GPU calib job A on EXACTLY GPU " + gpu_a + " (do not use other GPUs).\n";
+        c1p += preamble;
+        c1p += "export CUDA_VISIBLE_DEVICES=" + gpu_a + "\n";
+        c1p += "python -m mxmoe.quant.quant calib --model " + model_id + " --method " + qtype + " \\\n";
+        c1p += "  --metric layer_out_norm --qcfg " + filter_a + " --nsamples " + nsamples + "\n";
+        c1p += "Long job. ok=true if complete layer_out_norm json for " + filter_a + ".\n";
+        c1p += "If a partial json exists, prefer finishing a full clean run (overwrite OK).\n";
+        c1p += "artifact_path=output json. Verify nvidia-smi shows load mainly on GPU " + gpu_a + ".\n";
+        jobs.push(#{
+            prompt: c1p,
+            label: "calib-a-gpu" + gpu_a,
+            capability_mode: "all",
+            output_schema: step_schema,
+        });
+
+        let c2p = "";
+        c2p += "MULTI-GPU calib job B on EXACTLY GPU " + gpu_b + " (parallel with A; different scheme).\n";
+        c2p += preamble;
+        c2p += "export CUDA_VISIBLE_DEVICES=" + gpu_b + "\n";
+        c2p += "python -m mxmoe.quant.quant calib --model " + model_id + " --method " + qtype + " \\\n";
+        c2p += "  --metric layer_out_norm --qcfg " + filter_b + " --nsamples " + nsamples + "\n";
+        c2p += "ok=true if complete layer_out_norm json for " + filter_b + ". artifact_path=json.\n";
+        c2p += "Must NOT use GPU " + gpu_a + " or " + gpu_c + ".\n";
+        jobs.push(#{
+            prompt: c2p,
+            label: "calib-b-gpu" + gpu_b,
+            capability_mode: "all",
+            output_schema: step_schema,
+        });
     }
-    log("Calib A OK: " + c1.output.summary);
 
-    let c2p = "";
-    c2p += "Quant-loss calibration for scheme filter_b=" + filter_b + " model=" + model_id + ".\n";
-    c2p += preamble;
-    c2p += "python -m mxmoe.quant.quant calib \\\n";
-    c2p += "  --model " + model_id + " --method " + qtype + " \\\n";
-    c2p += "  --metric layer_out_norm --qcfg " + filter_b + " \\\n";
-    c2p += "  --nsamples " + nsamples + "\n\n";
-    c2p += "ok=true if layer_out_norm json for filter_b under calib/. artifact_path = path.\n";
-
-    let c2 = agent(c2p, #{
-        label: "calib-b",
-        capability_mode: "all",
-        output_schema: step_schema,
-    });
-    if c2 == () || !c2.success || c2.output == () || c2.output.ok != true {
-        let d = "calib filter_b failed";
-        if c2 != () && c2.success && c2.output != () {
-            d = c2.output.summary + " | " + c2.output.details;
+    if baseline_with_calib {
+        let bp = "";
+        bp += "MULTI-GPU baseline eval on EXACTLY GPU " + gpu_c + " IN PARALLEL with calib jobs.\n";
+        bp += preamble;
+        bp += "export CUDA_VISIBLE_DEVICES=" + gpu_c + "\n";
+        bp += "model_id=" + model_id + " tasks=" + task_args + "\n";
+        if paper_note != "" {
+            bp += "paper_note: " + paper_note + "\n";
         }
-        pause("infra", d);
+        bp += "Run full-precision / baseline PPL (+ zero-shot if in tasks) via quant.py eval or Evaluator.\n";
+        bp += "Do not wait for calib. ok=true if finite PPL>1. Record ppl and optional acc_avg.\n";
+        jobs.push(#{
+            prompt: bp,
+            label: "eval-baseline-gpu" + gpu_c,
+            capability_mode: "all",
+            output_schema: eval_schema,
+        });
     }
-    log("Calib B OK: " + c2.output.summary);
+
+    if jobs.len() == 0 {
+        log("Parallel-Calib: nothing to run");
+    } else {
+        log("Launching " + jobs.len().to_string() + " parallel GPU jobs (calib/baseline fan-out)");
+        let pres = parallel(jobs);
+
+        // Map results by position: [calib-a?, calib-b?, baseline?]
+        let idx = 0;
+        if !skip_calib {
+            let r0 = pres[idx];
+            idx += 1;
+            if r0 == () || !r0.success || r0.output == () || r0.output.ok != true {
+                let d = "calib-a failed";
+                if r0 != () && r0.success && r0.output != () {
+                    d = r0.output.summary + " | " + r0.output.details;
+                }
+                pause("infra", d);
+            }
+            c1_out = r0;
+            log("Calib A OK: " + r0.output.summary);
+
+            let r1 = pres[idx];
+            idx += 1;
+            if r1 == () || !r1.success || r1.output == () || r1.output.ok != true {
+                let d = "calib-b failed";
+                if r1 != () && r1.success && r1.output != () {
+                    d = r1.output.summary + " | " + r1.output.details;
+                }
+                pause("infra", d);
+            }
+            c2_out = r1;
+            log("Calib B OK: " + r1.output.summary);
+        }
+        if baseline_with_calib {
+            let r2 = pres[idx];
+            if r2 == () || !r2.success || r2.output == () || r2.output.ok != true {
+                let d = "baseline-with-calib failed";
+                if r2 != () && r2.success && r2.output != () {
+                    d = r2.output.summary + " | " + r2.output.details;
+                }
+                pause("verification", d);
+            }
+            base_eval = r2;
+            log("Baseline (parallel) OK: " + r2.output.summary);
+        }
+    }
 }
 
 // =============================================================================
@@ -303,15 +362,10 @@ phase("Align-Loss");
 // =============================================================================
 
 let alp = "";
-alp += "Align calib JSON paths with EXPERT_QUANT_LOSS for this model_id.\n";
+alp += "Align calib JSON with EXPERT_QUANT_LOSS for model_id=" + model_id + ".\n";
 alp += preamble;
-alp += "model_id=" + model_id + " qtype=" + qtype + " schemes: " + filter_a + ", " + filter_b + "\n";
-alp += "1) Read EXPERT_QUANT_LOSS[qtype][model_id] expected paths (if key missing, create entries or fix config)\n";
-alp += "2) Find actual calib outputs under calib/\n";
-alp += "3) symlink/copy or patch EXPERT_QUANT_LOSS so both schemes open successfully\n";
-alp += "4) Verify both files open in Python\n";
-alp += "ok=true only if both schemes resolve.\n";
-
+alp += "qtype=" + qtype + " schemes " + filter_a + " and " + filter_b + "\n";
+alp += "Symlink/copy or patch paths so both open. ok=true if both resolve.\n";
 let al = agent(alp, #{
     label: "align-loss",
     capability_mode: "all",
@@ -324,7 +378,7 @@ if al == () || !al.success || al.output == () || al.output.ok != true {
     }
     pause("infra", d);
 }
-log("Align loss OK: " + al.output.summary);
+log("Align OK: " + al.output.summary);
 
 // =============================================================================
 phase("Solver");
@@ -333,22 +387,18 @@ phase("Solver");
 let qconfig_hint = "qconfigs/" + filter_a + "+" + filter_b + "/" + model_id + "_" + qtype + "_Slayer_bs" + solver_batch + "_wbits" + wbits + "_r" + r_val + ".json";
 
 if skip_solver {
-    log("skip_solver=true — expect qconfig for model " + model_id + " near " + qconfig_hint);
+    log("skip_solver=true");
 } else {
     let sp = "";
-    sp += "ILP bits_solver for model_id=" + model_id + " (mixed precision qconfig).\n";
+    sp += "bits_solver ILP (CPU/Gurobi; GPU not required).\n";
     sp += preamble;
-    sp += "Ensure calib/perf/performance_table.json exists (copy from perf/ if needed).\n";
-    sp += "Command:\n";
-    sp += "python -m mxmoe.quant.bits_solver \\\n";
-    sp += "  --model " + model_id + " --qtype " + qtype + " \\\n";
-    sp += "  --wbits " + wbits + " --solve_mode layer --batch " + solver_batch + " \\\n";
-    sp += "  --r " + r_val + " \\\n";
+    sp += "copy perf/performance_table.json -> calib/perf/ if needed.\n";
+    sp += "python -m mxmoe.quant.bits_solver --model " + model_id + " --qtype " + qtype + " \\\n";
+    sp += "  --wbits " + wbits + " --solve_mode layer --batch " + solver_batch + " --r " + r_val + " \\\n";
     sp += "  --filter_list " + filter_a + " " + filter_b + " \\\n";
     sp += "  --trace_file calib/gate/" + model_id + "/" + dataset + "/" + seqlen + "/moe-gate.json \\\n";
-    sp += "  --perf_file calib/perf/performance_table.json\n\n";
-    sp += "ok=true if qconfig json exists (not only tile_cfg). artifact_path = qconfig path.\n";
-
+    sp += "  --perf_file calib/perf/performance_table.json\n";
+    sp += "ok=true if qconfig json exists. artifact_path=qconfig.\n";
     let sr = agent(sp, #{
         label: "bits-solver",
         capability_mode: "all",
@@ -367,109 +417,123 @@ if skip_solver {
     }
 }
 
-let zs_tasks = "arc_challenge arc_easy hellaswag lambada_openai lambada_standard piqa winogrande";
-let task_args = "ppl";
-if run_zeroshot {
-    task_args = "ppl " + zs_tasks;
-}
-
 // =============================================================================
-phase("Eval-Baseline");
-// =============================================================================
-
-let base_eval = ();
-if skip_baseline {
-    log("skip_baseline=true");
-} else {
-    let ep = "";
-    ep += "Evaluate BASELINE for model_id=" + model_id + " (PPL";
-    if run_zeroshot {
-        ep += " + zero-shot";
-    }
-    ep += ").\n";
-    ep += preamble;
-    if paper_note != "" {
-        ep += "Optional paper_note from args: " + paper_note + "\n";
-    }
-    ep += "tasks: " + task_args + "\n";
-    ep += "Prefer full-precision / no-quant path via quant.py eval or Evaluator.eval_ppl after load_hf_model.\n";
-    ep += "Attempt sensible baselines for THIS model; do not assume a single HF name.\n";
-    ep += "ok=true if finite PPL > 1. Record ppl, optional acc_avg.\n";
-
-    base_eval = agent(ep, #{
-        label: "eval-baseline",
-        capability_mode: "all",
-        output_schema: eval_schema,
-    });
-    if base_eval == () || !base_eval.success || base_eval.output == () || base_eval.output.ok != true {
-        let d = "baseline eval failed";
-        if base_eval != () && base_eval.success && base_eval.output != () {
-            d = base_eval.output.summary + " | " + base_eval.output.details;
-        }
-        pause("verification", d);
-    }
-    log("Baseline eval OK: " + base_eval.output.summary);
-}
-
-// =============================================================================
-phase("Eval-MxMoE");
+phase("Parallel-Eval");
 // =============================================================================
 
 let mx_eval = ();
-if skip_mxmoe_eval {
-    log("skip_mxmoe_eval=true");
-} else {
-    let ep2 = "";
-    ep2 += "Evaluate MxMoE mixed qconfig for model_id=" + model_id + ".\n";
-    ep2 += preamble;
-    ep2 += "qconfig hint: " + qconfig_hint + "\n";
-    ep2 += "Resolve real path: find qconfigs -name '*" + model_id + "*wbits" + wbits + "*r" + r_val + "*.json' ! -name '*tile*'\n";
-    ep2 += "python -m mxmoe.quant.quant eval --model " + model_id + " --method " + qtype + " \\\n";
-    ep2 += "  --qconfig <resolved.json> --tasks " + task_args + "\n\n";
-    if paper_note != "" {
-        ep2 += "Optional paper_note: " + paper_note + "\n";
-    }
-    ep2 += "ok=true if finite PPL. artifact_path = qconfig used.\n";
-
-    mx_eval = agent(ep2, #{
-        label: "eval-mxmoe",
-        capability_mode: "all",
-        output_schema: eval_schema,
-    });
-    if mx_eval == () || !mx_eval.success || mx_eval.output == () || mx_eval.output.ok != true {
-        let d = "mxmoe eval failed";
-        if mx_eval != () && mx_eval.success && mx_eval.output != () {
-            d = mx_eval.output.summary + " | " + mx_eval.output.details;
-        }
-        pause("verification", d);
-    }
-    log("MxMoE eval OK: " + mx_eval.output.summary);
-}
-
-// =============================================================================
-phase("Eval-Optional");
-// =============================================================================
-
 let uni_eval = ();
-if !run_uniform_w4a4 {
-    log("run_uniform_w4a4=false");
-} else {
-    let up = "";
-    up += "Optional uniform control using filter_a=" + filter_a + " for model " + model_id + ".\n";
-    up += preamble;
-    up += "python -m mxmoe.quant.quant eval --model " + model_id + " --method " + qtype + " \\\n";
-    up += "  --qstr " + filter_a + " --tasks " + task_args + "\n";
-    up += "ok=true if finite PPL.\n";
 
-    uni_eval = agent(up, #{
-        label: "eval-uniform",
-        capability_mode: "all",
-        output_schema: eval_schema,
-    });
-    if uni_eval == () || !uni_eval.success || uni_eval.output == () || uni_eval.output.ok != true {
-        log("uniform eval failed (optional)");
-    } else {
-        log("Uniform OK: " + uni_eval.output.summary);
+// If baseline was not run with calib, run it now (possibly in parallel with mxmoe)
+let need_baseline_now = !skip_baseline && !baseline_with_calib;
+let need_mx = !skip_mxmoe_eval;
+let need_uni = run_uniform_w4a4;
+
+if !need_baseline_now && !need_mx && !need_uni {
+    log("Parallel-Eval: nothing to run");
+} else {
+    let ejobs = [];
+
+    if need_baseline_now {
+        let bp = "";
+        bp += "Baseline eval on GPU " + gpu_a + ".\n";
+        bp += preamble;
+        bp += "export CUDA_VISIBLE_DEVICES=" + gpu_a + "\n";
+        bp += "tasks=" + task_args + " model=" + model_id + "\n";
+        bp += "ok=true if finite PPL. Record ppl/acc_avg.\n";
+        ejobs.push(#{
+            prompt: bp,
+            label: "eval-baseline-gpu" + gpu_a,
+            capability_mode: "all",
+            output_schema: eval_schema,
+        });
+    }
+
+    if need_mx {
+        let pin = gpu_b;
+        if need_baseline_now {
+            // baseline took gpu_a; mxmoe on gpu_b
+            pin = gpu_b;
+        } else {
+            pin = gpu_a;
+        }
+        let ep2 = "";
+        ep2 += "MxMoE mixed eval on EXACTLY GPU " + pin + ".\n";
+        ep2 += preamble;
+        ep2 += "export CUDA_VISIBLE_DEVICES=" + pin + "\n";
+        ep2 += "qconfig hint: " + qconfig_hint + "\n";
+        ep2 += "find qconfigs -name '*" + model_id + "*wbits" + wbits + "*' ! -name '*tile*'\n";
+        ep2 += "python -m mxmoe.quant.quant eval --model " + model_id + " --method " + qtype + " \\\n";
+        ep2 += "  --qconfig <resolved> --tasks " + task_args + "\n";
+        if paper_note != "" {
+            ep2 += "paper_note: " + paper_note + "\n";
+        }
+        ep2 += "ok=true if finite PPL. artifact_path=qconfig.\n";
+        ejobs.push(#{
+            prompt: ep2,
+            label: "eval-mxmoe-gpu" + pin,
+            capability_mode: "all",
+            output_schema: eval_schema,
+        });
+    }
+
+    if need_uni {
+        let upin = gpu_c;
+        if upin == "" || upin == gpu_a {
+            upin = gpu_b;
+        }
+        let up = "";
+        up += "Optional uniform " + filter_a + " on GPU " + upin + ".\n";
+        up += preamble;
+        up += "export CUDA_VISIBLE_DEVICES=" + upin + "\n";
+        up += "python -m mxmoe.quant.quant eval --model " + model_id + " --method " + qtype + " \\\n";
+        up += "  --qstr " + filter_a + " --tasks " + task_args + "\n";
+        up += "ok=true if finite PPL.\n";
+        ejobs.push(#{
+            prompt: up,
+            label: "eval-uniform-gpu" + upin,
+            capability_mode: "all",
+            output_schema: eval_schema,
+        });
+    }
+
+    log("Parallel-Eval launching " + ejobs.len().to_string() + " jobs");
+    let eres = parallel(ejobs);
+    let ei = 0;
+    if need_baseline_now {
+        let er = eres[ei];
+        ei += 1;
+        if er == () || !er.success || er.output == () || er.output.ok != true {
+            let d = "baseline eval failed";
+            if er != () && er.success && er.output != () {
+                d = er.output.summary + " | " + er.output.details;
+            }
+            pause("verification", d);
+        }
+        base_eval = er;
+        log("Baseline OK: " + er.output.summary);
+    }
+    if need_mx {
+        let er = eres[ei];
+        ei += 1;
+        if er == () || !er.success || er.output == () || er.output.ok != true {
+            let d = "mxmoe eval failed";
+            if er != () && er.success && er.output != () {
+                d = er.output.summary + " | " + er.output.details;
+            }
+            pause("verification", d);
+        }
+        mx_eval = er;
+        log("MxMoE OK: " + er.output.summary);
+    }
+    if need_uni {
+        let er = eres[ei];
+        if er == () || !er.success || er.output == () || er.output.ok != true {
+            log("uniform eval failed (optional)");
+        } else {
+            uni_eval = er;
+            log("Uniform OK: " + er.output.summary);
+        }
     }
 }
 
@@ -478,11 +542,10 @@ phase("Report");
 // =============================================================================
 
 let rep = "";
-rep += "Write markdown accuracy report for parameterized MoE model (PPL/ZS only).\n";
-rep += "Do NOT write under repo docs/. Put full markdown in details; ok=true.\n";
-rep += "model_id=" + model_id + " model_path=" + model_path + "\n";
-rep += "filter_a=" + filter_a + " filter_b=" + filter_b + " wbits=" + wbits + " r=" + r_val + "\n";
-rep += "qconfig_hint=" + qconfig_hint + "\n";
+rep += "Markdown accuracy report for model_id=" + model_id + " (multi-GPU run).\n";
+rep += "Do NOT write docs/. Full markdown in details; ok=true.\n";
+rep += "gpus a/b/c=" + gpu_a + "/" + gpu_b + "/" + gpu_c + "\n";
+rep += "qconfig=" + qconfig_hint + "\n";
 if paper_note != "" {
     rep += "paper_note=" + paper_note + "\n";
 }
@@ -496,15 +559,14 @@ if uni_eval != () && uni_eval.success && uni_eval.output != () {
     rep += "uniform: " + uni_eval.output.summary + "\n";
 }
 rep += "align: " + al.output.summary + "\n";
-rep += "Sections: config, artifacts, results table, skips, non-goals (no kernel).\n";
+rep += "Sections: config, multi-GPU layout, artifacts, results, skips, non-goals.\n";
 
 let repor = agent(rep, #{
     label: "report",
     capability_mode: "all",
     output_schema: step_schema,
 });
-
-let report_body = "# reproduce-acc\n\nmodel_id=" + model_id + "\n";
+let report_body = "# reproduce-acc\nmodel_id=" + model_id + "\n";
 if repor != () && repor.success && repor.output != () && repor.output.details != () {
     report_body = repor.output.details;
 }
@@ -528,9 +590,12 @@ if mx_eval != () && mx_eval.success && mx_eval.output != () {
 }
 
 complete(#{
-    summary: "MoE accuracy pipeline finished for model_id=" + model_id + " (PPL/zero-shot; no kernel)",
+    summary: "MoE accuracy multi-GPU pipeline done for " + model_id,
     model_id: model_id,
     model_path: model_path,
+    gpu_a: gpu_a,
+    gpu_b: gpu_b,
+    gpu_c: gpu_c,
     qconfig: qconfig_hint,
     baseline_ppl: base_ppl,
     mxmoe_ppl: mx_ppl,

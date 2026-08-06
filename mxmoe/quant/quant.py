@@ -181,7 +181,9 @@ def prepare_inps(model: PreTrainedModel, dataloader: list[Tensor]):
     layers[0] = Catcher(layers[0])
     for batch in tqdm(dataloader, desc="Preparing inputs"):
         try:
-            model(batch.to(model.device))
+            # Use cuda:0 (dev) — embed/layer0 were moved there; model.device may be CPU
+            # when calib loads large MoE weights off-GPU (see quant main / 40GB A100 path).
+            model(batch.to(dev))
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -522,9 +524,16 @@ class MoeModelQuantizer:
         moe_bits_alloc: QLinearConfig,
         attn_bits_alloc: QLinearConfig=None,
     ) -> list[list[float]] | list[float]:
-        ori_dev = self.ori_model.device
-        if self.model_id in ["qwen2_moe_57b", "mixtral"]: assert ori_dev.type == "cpu"
-        else: assert "cuda" in ori_dev.type
+        # Prefer a real parameter device: multi-device HF maps may not expose .device cleanly.
+        try:
+            ori_dev = self.ori_model.device
+        except Exception:
+            ori_dev = next(self.ori_model.parameters()).device
+        # layer_out_norm streams one layer to cuda:0; model may live on CPU to fit 40GB GPUs.
+        if self.model_id in ["qwen2_moe_57b", "mixtral"]:
+            assert ori_dev.type == "cpu"
+        else:
+            assert ori_dev.type in ("cuda", "cpu"), f"unexpected device {ori_dev}"
 
         assert self.quantized_model is None, "Quantized model should not be initialized"
 
@@ -544,8 +553,9 @@ class MoeModelQuantizer:
             dev = torch.device("cuda:0")
 
             inps, attn_mask, position_ids, pos_emb = prepare_inps(self.ori_model, dataloader)
+            # Keep only one float64 buffer on GPU. Per-sample Frobenius accumulation is
+            # mathematically equal to torch.norm(q-fp) and avoids a second 8GiB tensor + temp.
             full_precision_outs: Tensor = torch.zeros_like(inps).to(torch.float64)
-            quantized_outs: Tensor = torch.zeros_like(inps).to(torch.float64)
 
             for layer_idx in tqdm(range(len(layers))):
                 self.ori_model.model.layers[layer_idx] = layers[layer_idx].to(dev)
@@ -577,16 +587,17 @@ class MoeModelQuantizer:
                             else:
                                 self.quant_model_weight_layer(self.ori_model, layer_idx, qlayer_cfg, attn_bits_alloc)
                             self.plug_act_quant_hook_layer(self.ori_model, layer_idx, qlayer_cfg, attn_bits_alloc)
+                            # 3. quantization error (chunked Frobenius norm; same as full-tensor norm)
+                            err_sq = 0.0
                             for i in range(num_samples):
-                                quantized_outs[i] = layer(
+                                qout = layer(
                                     inps[i].unsqueeze(0),
                                     attention_mask=attn_mask,
                                     position_ids=position_ids,
                                     position_embeddings=pos_emb,
                                 )[0].to(torch.float64)
-                            # 3. calculate the quantization error
-                            # quant_err = F.mse_loss(quantized_outs, full_precision_outs).item()
-                            quant_err = torch.norm(quantized_outs-full_precision_outs).item()
+                                err_sq += torch.norm(qout - full_precision_outs[i]).item() ** 2
+                            quant_err = err_sq ** 0.5
                             expert_err.append(quant_err)
 
                             # 4. recover the FULL precision layer
@@ -598,6 +609,7 @@ class MoeModelQuantizer:
 
                 del cpu_weights_copy
                 self.ori_model.model.layers[layer_idx] = layers[layer_idx].to(ori_dev)
+                torch.cuda.empty_cache()
 
                 # 5. serialization
                 if not os.path.exists(os.path.dirname(save_path)):
@@ -609,7 +621,7 @@ class MoeModelQuantizer:
 
 
                 # 6. prepare the inputs for next layer
-                inps, full_precision_outs = full_precision_outs.to(inps.dtype), full_precision_outs
+                inps, full_precision_outs = full_precision_outs.to(dtype=inps.dtype, device=dev), full_precision_outs
 
         elif metric == "model_out_norm":
             # inps: [num_samples, seqlen]
@@ -794,8 +806,10 @@ if __name__ == "__main__":
         }
 
     ori_wcfg = (16,-1)
-    if model_id in ["qwen2_moe_57b", "mixtral"] and args.sub == "calib":
-        print(f">>> load model to CPU")
+    # Calib layer_out_norm streams one decoder layer to cuda:0; keep weights on CPU so
+    # qwen2_moe (~28GiB bf16) + float64 activation buffers fit on 40GB A100s.
+    if model_id in ["qwen2_moe", "qwen2_moe_57b", "mixtral"] and args.sub == "calib":
+        print(f">>> load model to CPU (calib sequential layer offload)")
         model_name = ID2NAME[model_id]
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
