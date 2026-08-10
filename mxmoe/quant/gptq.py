@@ -317,7 +317,8 @@ def llama_sequential(args, model, dataloader, dev):
     inps = torch.zeros(
         (args.nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None}
+    # Newer transformers (e.g. 4.5x Qwen2MoE) require position_embeddings on layer forward.
+    cache = {'i': 0, 'attention_mask': None, 'position_ids': None, 'position_embeddings': None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -326,8 +327,9 @@ def llama_sequential(args, model, dataloader, dev):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
+            cache['attention_mask'] = kwargs.get('attention_mask')
+            cache['position_ids'] = kwargs.get('position_ids')
+            cache['position_embeddings'] = kwargs.get('position_embeddings')
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -348,6 +350,7 @@ def llama_sequential(args, model, dataloader, dev):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
 
     print('Ready.')
 
@@ -394,7 +397,12 @@ def llama_sequential(args, model, dataloader, dev):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )[0]
             for h in handles:
                 h.remove()
 
@@ -407,7 +415,12 @@ def llama_sequential(args, model, dataloader, dev):
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(
+                inps[j].unsqueeze(0),
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )[0]
 
         if "cpu" in ori_dev.type:
             layer = layers[i].to(ori_dev)

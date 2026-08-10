@@ -72,8 +72,6 @@ class Evaluator:
     def eval_tasks(self, model, task_list: list[str], bs=128, backend="hf"):
         import lm_eval
         from lm_eval import tasks
-        from lm_eval import utils as lm_eval_utils
-        from lm_eval.api.registry import ALL_TASKS
         from lm_eval.models.huggingface import HFLM
 
         if backend == "hf":
@@ -81,8 +79,6 @@ class Evaluator:
         else:
             raise ValueError(f"Unknown backend: {backend}")
 
-        # tasks_list = tasks.get_task_dict(task_names)
-        # task_names = lm_eval_utils.pattern_match(tasks, ALL_TASKS)
         eval_tasks = tasks.get_task_dict(task_list)
         print(f"Evaluated task_names: {eval_tasks.keys()}")
         results = lm_eval.simple_evaluate(hflm, tasks=list(eval_tasks.keys()), batch_size=bs)['results']

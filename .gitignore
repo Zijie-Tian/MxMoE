@@ -30,4 +30,10 @@ log/*
 calib/*
 calib_bkp/*
 qconfigs/*
+# Machine-local secrets / model paths (see .env.example)
 /.env
+# Gurobi debug dumps (bits_solver may write bits_model-*.lp)
+*.lp
+bits_model-*.lp
+# Agent/workflow scratch notes (not source)
+scratch/
