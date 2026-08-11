@@ -24,6 +24,8 @@ src/generated/*
 mxmoe/kernels/src/generated/
 mxmoe/kernels/src/build/
 out/
+# HF GPTQ / export artifacts (large weights; see mxmoe.quant.export_gptq_hf)
+outputs/
 # Local env setup helpers (not source; do not put install reports in docs/)
 requirements-smoke.txt
 log/*

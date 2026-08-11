@@ -177,11 +177,26 @@ class GPTQ:
         self.H += inp.matmul(inp.t()) # [K, K]
 
     def fasterquant(
-        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False
+        self,
+        blocksize=128,
+        percdamp=.01,
+        groupsize=-1,
+        actorder=False,
+        static_groups=False,
+        return_quant_state: bool = False,
     ):
+        """GPTQ weight update.
+
+        When ``return_quant_state=True``, also returns a dict with:
+          - ``scale``: [out_features, n_groups] float
+          - ``zero``:  [out_features, n_groups] float (GPTQ additive zero-point)
+          - ``g_idx``: [in_features] int32 group id per input channel
+          - ``weight``: fake-quant float weight [out, in] (same as written to the layer)
+        """
         # [N, K]
         W = self.layer.weight.data.clone()
         W = W.float()
+        rows, columns = self.rows, self.columns
 
         tick = time.time()
 
@@ -194,12 +209,20 @@ class GPTQ:
         H[dead, dead] = 1
         W[:, dead] = 0
 
+        g_idx = torch.tensor(
+            [i // groupsize if groupsize > 0 else 0 for i in range(columns)],
+            dtype=torch.int32,
+            device=self.dev,
+        )
+
         if static_groups:
             import copy
             groups = []
-            for i in range(0, self.columns, groupsize):
+            # Find params on original column order before act-order permute.
+            step = groupsize if groupsize > 0 else columns
+            for i in range(0, columns, step):
                 quantizer = copy.deepcopy(self.quantizer)
-                quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
+                quantizer.find_params(W[:, i:(i + step)], weight=True)
                 groups.append(quantizer)
 
         if actorder:
@@ -207,9 +230,14 @@ class GPTQ:
             W = W[:, perm]
             H = H[perm][:, perm]
             invperm = torch.argsort(perm)
+            g_idx = g_idx[perm]
 
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
+
+        # Per-column scale/zero in the (possibly permuted) column order used during quant.
+        scale_cols = torch.zeros((rows, columns), device=self.dev, dtype=torch.float32)
+        zero_cols = torch.zeros((rows, columns), device=self.dev, dtype=torch.float32)
 
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
@@ -243,6 +271,15 @@ class GPTQ:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
 
+                # scale/zero shaped [N, 1] for weight quantizer
+                sc = self.quantizer.scale.flatten().float()
+                z = self.quantizer.zero.flatten().float()
+                if sc.numel() == 1:
+                    sc = sc.expand(rows)
+                    z = z.expand(rows)
+                scale_cols[:, i1 + i] = sc
+                zero_cols[:, i1 + i] = z
+
                 q = quantize(
                     w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
                 ).flatten()
@@ -269,10 +306,43 @@ class GPTQ:
 
         if actorder:
             Q = Q[:, invperm]
+            scale_cols = scale_cols[:, invperm]
+            zero_cols = zero_cols[:, invperm]
+            g_idx = g_idx[invperm]
 
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         if DEBUG:
             print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+
+        if not return_quant_state:
+            return None
+
+        # Compact per-group scale/zero: take first column of each group (static groups).
+        if groupsize is None or groupsize <= 0:
+            n_groups = 1
+            scales = scale_cols[:, :1].contiguous()
+            zeros = zero_cols[:, :1].contiguous()
+            g_idx = torch.zeros(columns, dtype=torch.int32, device=self.dev)
+        else:
+            n_groups = (columns + groupsize - 1) // groupsize
+            scales = torch.zeros((rows, n_groups), device=self.dev, dtype=torch.float32)
+            zeros = torch.zeros((rows, n_groups), device=self.dev, dtype=torch.float32)
+            for g in range(n_groups):
+                col = min(g * groupsize, columns - 1)
+                scales[:, g] = scale_cols[:, col]
+                zeros[:, g] = zero_cols[:, col]
+            g_idx = torch.tensor(
+                [min(i // groupsize, n_groups - 1) for i in range(columns)],
+                dtype=torch.int32,
+                device=self.dev,
+            )
+
+        return {
+            "scale": scales.cpu(),
+            "zero": zeros.cpu(),
+            "g_idx": g_idx.cpu().to(torch.int32),
+            "weight": Q.detach().cpu(),
+        }
 
     def free(self):
         if DEBUG:

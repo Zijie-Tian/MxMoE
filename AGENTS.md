@@ -86,7 +86,93 @@ CUDA_VISIBLE_DEVICES=0 python -m mxmoe.quant.moe_tracer --model qwen2_moe --trac
 - Fit-map is **full-precision eval only**: it is rejected (SystemExit) together with `--qstr/--qconfig/--qweight`, because in-place quantization on offloaded layers is silently dropped. Calib `layer_out_norm` / online GPTQ keep their own CPU + per-layer path and do not use fit-map.
 - Verified: `qwen2_moe` FP16 wikitext2 PPL = 6.79 (73×4096, ~5.2s/sample) on a single 3090 with `16GiB` GPU budget.
 
+## Expert GPTQ export (W1–W4 A16) — status & usage
+
+Uniform **weight-only GPTQ** on MoE expert linears (`gate` / `up` / `down` + shared experts; also dense MLP on non-MoE layers such as `ds2` layer 0). Attention / embed / norm / `lm_head` stay full precision. Entry point: **`python -m mxmoe.quant.export_gptq_hf`**.
+
+### What is implemented
+
+| Piece | Path / notes |
+|-------|----------------|
+| CLI + sequential expert GPTQ | `mxmoe/quant/export_gptq_hf.py` |
+| GPTQ `fasterquant(..., return_quant_state=True)` | `mxmoe/quant/gptq.py` — returns `scale` / `zero` / `g_idx` / fake-quant `weight` |
+| Pack helpers (GPTQ v1 layout) | `mxmoe/quant/gptq_pack.py` — `qweight` / `qzeros` / `scales` / `g_idx` |
+| Export root (large HF dumps) | Default **`/mnt/raid/tzj/mxmoe/exported_hf_models/<name>/`**; override with env `MXMOE_EXPORT_HF_ROOT` or `--save` / `--save-name` |
+| Remote-code copy for HF reload | After `save_pretrained`, copies `*.py` from the source checkpoint (e.g. `modeling_deepseek.py`) so `trust_remote_code` loads |
+
+### Two export formats
+
+| `--export-format` | Meaning | Bits | Load path |
+|-------------------|---------|------|-----------|
+| **`hf_float`** (default) | GPTQ-optimized **fake-quant float** weights; full HF `save_pretrained` tree | **1, 2, 3, 4, 8** | `AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)` |
+| **`gptq_pack`** | Packed **AutoGPTQ/v1** tensors (`qweight` / `qzeros` / `scales` / `g_idx`) in state_dict / safetensors | **2, 3, 4, 8 only** (W1 → `NotImplementedError`) | Needs a GPTQ backend (e.g. gptqmodel); **not** fully validated end-to-end in-repo |
+
+Also written: `quantize_config.json`, `mxmoe_export_meta.json`, optional `eval_ppl.json` when `--eval-ppl`.
+
+### Explicitly **not** implemented (raise `NotImplementedError`)
+
+- Mixed-precision ILP `--qconfig` export
+- Weight–activation schemes (e.g. W4A4) as export format
+- **Online** Hadamard (`--online-had`); offline `--hadamard` is allowed for research but changes rotation/fuse story
+- `--quant-attn` (attention GPTQ export)
+- `gptq_pack` for **W1**
+
+### Usage (conda env `mxmoe`)
+
+```bash
+# Check model path first
+python project_config.py --check ds2
+
+# Expert GPTQ W4A16 g128 asym → HF float dump on RAID (default root)
+CUDA_VISIBLE_DEVICES=0 python -m mxmoe.quant.export_gptq_hf \
+  --model ds2 --wbits 4 --groupsize 128 \
+  --nsamples 128 --seqlen 4096 \
+  --device-map cpu \
+  --export-format hf_float \
+  --eval-ppl
+
+# Other bits: --wbits 1|2|3|4
+# Optional name: --save-name ds2-gptq-w4-g128-asym
+# Optional pack (W2–W4/W8 only; needs GPTQ runtime to load):
+#   --export-format gptq_pack
+
+# Smoke: only first N layers
+#   --max-layers 2
+```
+
+Load exported `hf_float` model:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+path = "/mnt/raid/tzj/mxmoe/exported_hf_models/ds2-gptq-w4-g128-asym"
+tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    path, trust_remote_code=True, torch_dtype="auto", device_map="auto"
+)
+```
+
+### Verified once (ds2 / DeepSeek-V2-Lite, expert WkA16 g128 asym, `hf_float`)
+
+WikiText2 PPL, `input_len=4096` (same evaluator path as `mxmoe.quant.evaluator`):
+
+| Checkpoint | PPL (approx.) |
+|------------|----------------|
+| FP baseline | 5.92 |
+| W4A16 GPTQ experts | 5.97 |
+| W3A16 | 6.24 |
+| W2A16 | 8.89 |
+| W1A16 | ~1e5 (unusable quality without further recipes, e.g. Had) |
+
+Artifacts (gitignored large dumps): under `MXMOE_EXPORT_HF_ROOT` / default RAID path above. Summary JSON may exist as `ds2_w1w2w3w4_summary.json` next to those dirs when produced by ops scripts — **do not** commit weight dumps.
+
+### Agent notes
+
+- Prefer **`hf_float`** for accuracy / reloadability; use **`gptq_pack`** only when a packed GPTQ consumer is required and bits ∈ {2,3,4,8}.
+- Large exports belong on **RAID** (`/mnt/raid/tzj/...`), not `/mnt/data` (often full).
+- Do not bake machine-local export paths into tracked code defaults beyond the documented RAID default; operators may override with `MXMOE_EXPORT_HF_ROOT`.
+
 ## Related conventions
 
 - Prefer minimal, necessary source diffs; keep generated kernels/build trees out of git (see `.gitignore`).
 - Prefer the isolated conda env **`mxmoe`** for MxMoE work; do not pollute unrelated envs unless the user asks.
+- Large export trees under `outputs/` / RAID export roots are gitignored; do not commit model weights.
