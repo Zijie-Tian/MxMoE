@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import hashlib
 import torch
 import pickle
 import argparse
@@ -173,9 +174,11 @@ def prepare_inps(model: PreTrainedModel, dataloader: list[Tensor]):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.to(dev)
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            cache['position_embeddings'] = kwargs['position_embeddings']
+            cache['attention_mask'] = kwargs.get('attention_mask')
+            cache['position_ids'] = kwargs.get('position_ids')
+            # DeepSeek-V2 decoder layers do not take position_embeddings.
+            # Qwen2-MoE does. Missing means None, which **kwargs accepts.
+            cache['position_embeddings'] = kwargs.get('position_embeddings')
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -305,6 +308,7 @@ class MoeModelQuantizer:
 
         self.quantized_model = None
         self.act_quant_hooks: list[torch.utils.hooks.RemovableHandle] = []
+        self.gptq_layer_stats: list[dict] = []
 
 
     # def __del__(self):
@@ -346,13 +350,28 @@ class MoeModelQuantizer:
             # if self.model_type == "deepseek_v2": qconfigs.layers[0] = build_uni_qlayer_cfg(moe_bits_alloc, len(qmodel_experts[0]))
             moe_bits_alloc = qconfigs
 
+        self._assert_qconfig_matches_modules(self.quantized_model, moe_bits_alloc)
+        if self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]:
+            bpv = self._expert_bpv(self.quantized_model, moe_bits_alloc)
+            self.expert_bpv_report = bpv
+            logger.info(
+                ">>> Expert BPV (routed+shared, DS2 dense0 excluded): "
+                f"payload={bpv['payload_bpv']:.6f} effective={bpv['effective_bpv']:.6f} "
+                f"params={bpv['expert_parameters']} matrices={bpv['expert_matrices']}"
+            )
+
         self.preprocess_weight(self.quantized_model, -1)
 
         for layer_i in tqdm(range(self.num_layers), desc="Quantizing MoE layer"):
+            # Solved DS2 configs already pin dense layer-0 MLP to W4A16 g-1 asym.
+            # Do not replace that entry: QLinearConfig(4) would flip a_sym and
+            # would rewrite a solved allocation.
             if self.model_id == "ds2" and layer_i == 0:
-                moe_bits_alloc.layers[str(layer_i)].experts["0"].gate = QLinearConfig(4)
-                moe_bits_alloc.layers[str(layer_i)].experts["0"].up = QLinearConfig(4)
-                moe_bits_alloc.layers[str(layer_i)].experts["0"].down = QLinearConfig(4)
+                for proj_name, cfg in moe_bits_alloc.layers["0"].experts["0"].qmap().items():
+                    if cfg.w_bits != 4 or cfg.w_gsize != -1 or cfg.w_sym or cfg.a_bits != 16:
+                        raise RuntimeError(
+                            f"DS2 dense0 {proj_name} must stay W4A16 g-1 asym, got {cfg}"
+                        )
 
             self.quant_model_weight_layer(self.quantized_model, layer_i, moe_bits_alloc.layers[str(layer_i)], attn_bits_alloc)
             self.plug_act_quant_hook_layer(self.quantized_model, layer_i, moe_bits_alloc.layers[str(layer_i)], attn_bits_alloc)
@@ -383,6 +402,165 @@ class MoeModelQuantizer:
                     else:
                         raise NotImplementedError("")
 
+
+    def _assert_qconfig_matches_modules(self, model: PreTrainedModel, moe_bits_alloc: QModelConfig) -> None:
+        """Fail before GPTQ if a solved qconfig does not line up with expert modules."""
+        for layer_i in range(self.num_layers):
+            experts = get_expert_linears(model, layer_idx=layer_i, exclude_non_moe_layer=False)
+            qlayer = moe_bits_alloc.layers[str(layer_i)]
+            expected = {str(i) for i in range(len(experts))}
+            if set(qlayer.experts) != expected:
+                raise RuntimeError(
+                    f"{self.model_id} layer {layer_i}: qconfig experts {sorted(qlayer.experts)} "
+                    f"!= modules {sorted(expected)}"
+                )
+            for expert_idx, expert in enumerate(experts):
+                names = set(get_linears_in_one_expert(expert))
+                if names != {"gate", "up", "down"}:
+                    raise RuntimeError(
+                        f"{self.model_id} layer {layer_i} expert {expert_idx}: "
+                        f"linears {sorted(names)} != gate/up/down"
+                    )
+
+    def _expert_bpv(self, model: PreTrainedModel, moe_bits_alloc: QModelConfig) -> dict:
+        """Parameter-weighted expert BPV. DS2 dense layer 0 is excluded."""
+        matrices = 0
+        params = 0
+        payload_bits = 0
+        for layer_i in range(self.num_layers):
+            if self.model_id == "ds2" and layer_i == 0:
+                continue
+            experts = get_expert_linears(model, layer_idx=layer_i, exclude_non_moe_layer=False)
+            for expert_idx, expert in enumerate(experts):
+                qmap = moe_bits_alloc.layers[str(layer_i)].experts[str(expert_idx)].qmap()
+                for name, linear in get_linears_in_one_expert(expert).items():
+                    n = linear.weight.numel()
+                    matrices += 1
+                    params += n
+                    payload_bits += n * qmap[name].w_bits
+        payload = payload_bits / params
+        return {
+            "expert_matrices": matrices,
+            "expert_parameters": params,
+            "payload_bits": payload_bits,
+            "payload_bpv": payload,
+            "effective_bpv": payload + 0.25,
+        }
+
+    def _run_layer_samples(self, layer: nn.Module, store: Tensor | None) -> None:
+        """Forward every cached sample. ``store`` receives outputs; inputs stay put."""
+        for j in range(self.gptq_nsamples):
+            out = layer(
+                self.gptq_layer_state[j].unsqueeze(0),
+                attention_mask=self.gptq_attention_mask,
+                position_ids=self.gptq_position_ids,
+                position_embeddings=self.gptq_pos_emb,
+            )[0]
+            if store is None:
+                self.gptq_layer_state[j] = out
+            else:
+                store[j] = out
+
+    @torch.no_grad()
+    def _gptq_quantize_layer(self, model: PreTrainedModel, layer_idx: int, moe_qconfig: QLayerConfig) -> None:
+        """GPTQ one decoder layer without advancing inputs inside the weight loop.
+
+        Hessians come from one pre-quant forward (same contract as
+        ``export_gptq_hf`` / ``prequant_input_propagation=canonical_quantized_layer_outputs``).
+        The layer is moved to the calibration-input device for that work, then
+        returned to its original device so the rest of a CPU-resident model
+        does not sit on the GPU.
+        """
+        dev = self.gptq_layer_state.device
+        layer = model.model.layers[layer_idx]
+        orig_dev = next(layer.parameters()).device
+        if orig_dev != dev:
+            layer = layer.to(dev)
+            model.model.layers[layer_idx] = layer
+
+        targets: list[tuple[nn.Linear, QLinearConfig, int, str]] = []
+        layer_experts = get_expert_linears(model, layer_idx=layer_idx, exclude_non_moe_layer=False)
+        for expert_idx, expert in enumerate(layer_experts):
+            qmap = moe_qconfig.experts[str(expert_idx)].qmap()
+            for linear_block, module in get_linears_in_one_expert(expert).items():
+                cfg = qmap[linear_block]
+                if cfg.w_bits >= 16:
+                    continue
+                targets.append((module, cfg, expert_idx, linear_block))
+
+        torch.cuda.reset_peak_memory_stats(dev)
+        t0 = time.time()
+        print(
+            f"[gptq] layer {layer_idx} start linears={len(targets)} "
+            f"nsamples={self.gptq_nsamples} dev={dev}",
+            flush=True,
+        )
+
+        if targets:
+            gptq_objs: list[GPTQ] = []
+            for module, cfg, _expert_idx, _linear_block in targets:
+                gptq = GPTQ(module)
+                gptq.quantizer = GPTQuantizer()
+                gptq.quantizer.configure(cfg.w_bits, perchannel=True, sym=cfg.w_sym, mse=False)
+                gptq_objs.append(gptq)
+
+            def _hook(gptq_obj):
+                def _fn(_module, inp, out):
+                    gptq_obj.add_batch(inp[0].data, out.data)
+                return _fn
+
+            handles = [
+                module.register_forward_hook(_hook(gptq_obj))
+                for (module, _cfg, _ei, _lb), gptq_obj in zip(targets, gptq_objs)
+            ]
+            # Side buffer: the saved layer inputs must survive this pass.
+            hidden = torch.empty_like(self.gptq_layer_state)
+            self._run_layer_samples(layer, hidden)
+            del hidden
+            for handle in handles:
+                handle.remove()
+
+            for (module, cfg, expert_idx, linear_block), gptq_obj in zip(targets, gptq_objs):
+                if gptq_obj.nsamples == 0:
+                    print(
+                        f"[gptq] WARN layer {layer_idx} expert {expert_idx} {linear_block} "
+                        "received no calibration tokens",
+                        flush=True,
+                    )
+                print(
+                    f"[gptq] L{layer_idx} E{expert_idx} {linear_block} "
+                    f"W{cfg.w_bits} g{cfg.w_gsize} sym={cfg.w_sym}",
+                    flush=True,
+                )
+                gptq_obj.fasterquant(
+                    percdamp=self.gptq_percdamp,
+                    groupsize=cfg.w_gsize,
+                    actorder=True,
+                    static_groups=True,
+                )
+                gptq_obj.free()
+
+        # Quantized layer outputs become the next layer's inputs, once.
+        self._run_layer_samples(layer, None)
+        peak = torch.cuda.max_memory_allocated(dev)
+        elapsed = time.time() - t0
+        stat = {
+            "layer": layer_idx,
+            "linears": len(targets),
+            "seconds": round(elapsed, 3),
+            "peak_bytes": int(peak),
+        }
+        self.gptq_layer_stats.append(stat)
+        print(
+            f"[gptq] layer {layer_idx} done in {elapsed:.1f}s "
+            f"peak_mem_gib={peak / 1024 ** 3:.2f}",
+            flush=True,
+        )
+
+        if orig_dev != dev:
+            model.model.layers[layer_idx] = layer.to(orig_dev)
+        del layer
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
     def quant_model_weight_layer(self, model: PreTrainedModel, layer_idx: int, moe_qconfig: QLayerConfig, attn_qconfig: QLinearConfig=None):
@@ -423,7 +601,14 @@ class MoeModelQuantizer:
 
         for layer_i in range(self.num_layers):
             if layer_idx != -1 and layer_idx != layer_i: continue
-            cur_layer = model.model.layers[layer_i]
+
+            # One hessian pass over the saved layer inputs, then quantize every
+            # targeted linear, then one more pass to publish quantized outputs
+            # as the next layer's inputs. Do not write those inputs inside the
+            # per-weight loop: that feeds this layer its own outputs repeatedly.
+            if self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]:
+                self._gptq_quantize_layer(model, layer_i, moe_qconfig)
+                continue
 
             layer_experts = get_expert_linears(model, layer_idx=layer_i, exclude_non_moe_layer=False)
             # 1. quantize the weights of moe layer
@@ -434,30 +619,6 @@ class MoeModelQuantizer:
                 for linear_block, m in weights_in_expert.items():
                     cfg = qmap[linear_block]
                     if cfg.w_bits >= 16: continue
-                    # GPTQ
-                    if self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]:
-                        print(f"Quantizing layer-{layer_i} expert-{expert_idx} block-{linear_block} with GPTQ ...")
-                        gptq = GPTQ(m)
-                        gptq.quantizer = GPTQuantizer()
-                        gptq.quantizer.configure(
-                            cfg.w_bits, perchannel=True, sym=cfg.w_sym, mse=False
-                        )
-                        handle: torch.utils.hooks.RemovableHandle = []
-                        handle = m.register_forward_hook(lambda _, inp, out: gptq.add_batch(inp[0].data, out.data))
-                        # if self.gptq_attention_mask
-                        for j in range(self.gptq_nsamples):
-                            self.gptq_layer_state[j] = cur_layer(
-                                self.gptq_layer_state[j].unsqueeze(0),
-                                attention_mask=self.gptq_attention_mask,
-                                position_ids=self.gptq_position_ids,
-                                position_embeddings=self.gptq_pos_emb,
-                            )[0]
-                        handle.remove()
-                        gptq.fasterquant(
-                            percdamp=self.gptq_percdamp, groupsize=cfg.w_gsize, actorder=True, static_groups=True
-                        )
-                        gptq.free()
-                        continue
                     # RTN
                     quantizer = Quantizer(cfg.w_bits, cfg.w_sym, cfg.w_gsize, cfg.w_clip)
                     m.weight.data = quantizer.fake_quant(m.weight.data)
@@ -701,6 +862,88 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _assert_qconfig_matches_weight_map(qconfig_path: str) -> None:
+    """Cross-check solved qconfig bits against the sibling name→bit table."""
+    wmap_path = os.path.join(os.path.dirname(qconfig_path), "expert_weight_map.json")
+    if not os.path.isfile(wmap_path):
+        print(f"[qconfig] no sibling expert_weight_map.json beside {qconfig_path}", flush=True)
+        return
+    with open(qconfig_path) as f:
+        qcfg = json.load(f)
+    qcfg.pop("LT", None)
+    with open(wmap_path) as f:
+        wmap = json.load(f)
+    mismatches = []
+    for name, rec in wmap.items():
+        got = qcfg[str(rec["layer"])]["experts"][str(rec["expert"])][rec["projection"]]
+        for field in ("w_bits", "w_gsize", "w_sym", "a_bits"):
+            if got[field] != rec[field]:
+                mismatches.append(f"{name} {field}: qconfig={got[field]} map={rec[field]}")
+                if len(mismatches) >= 5:
+                    break
+        if len(mismatches) >= 5:
+            break
+    if mismatches:
+        raise RuntimeError(
+            f"{qconfig_path} disagrees with {wmap_path}: " + "; ".join(mismatches)
+        )
+    print(
+        f"[qconfig] weight map matches qconfig ({len(wmap)} tensors) sha={_file_sha256(qconfig_path)}",
+        flush=True,
+    )
+
+
+def _write_quant_report_and_maybe_save(args, model_quantizer, qmodel, tokenizer, model_id, model_name, quant_type, logger) -> None:
+    import transformers
+
+    report = {
+        "model_id": model_id,
+        "model_path": model_name,
+        "qconfig": args.qconfig,
+        "qconfig_sha256": _file_sha256(args.qconfig) if args.qconfig else None,
+        "method": quant_type,
+        "online_had": bool(args.online_had),
+        "gptq_nsamples": args.gptq_nsamples,
+        "seqlen": 4096,
+        "seed": args.seed,
+        "percdamp": getattr(model_quantizer, "gptq_percdamp", None),
+        "act_order": True,
+        "static_groups": True,
+        "expert_bpv": getattr(model_quantizer, "expert_bpv_report", None),
+        "layer_stats": getattr(model_quantizer, "gptq_layer_stats", []),
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "cuda": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+    }
+    if args.save:
+        os.makedirs(os.path.dirname(os.path.abspath(args.save)), exist_ok=True)
+        with open(args.save, "w") as f:
+            json.dump(report, f, indent=2)
+        logger.info(f"Quant report -> {args.save}")
+    if args.save_model:
+        from pathlib import Path
+        from mxmoe.quant.export_gptq_hf import copy_trust_remote_code_files
+
+        out = Path(args.save_model)
+        out.mkdir(parents=True, exist_ok=True)
+        qmodel.config.torch_dtype = str(next(qmodel.parameters()).dtype).replace("torch.", "")
+        tokenizer.save_pretrained(out)
+        qmodel.save_pretrained(out, safe_serialization=True)
+        copied = copy_trust_remote_code_files(model_name, out)
+        with open(out / "mxmoe_quant_report.json", "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"[quant] saved fake-quant model -> {out} remote={copied}", flush=True)
+
+
 if __name__ == "__main__":
     """
     e.g.
@@ -730,6 +973,23 @@ if __name__ == "__main__":
     parser_eval.add_argument("--online_had", action="store_true", help="Whether to use use Hadamard transform")
     parser_eval.add_argument("--bs", type=int, default=128, help="zero-shot task eval batch")
     parser_eval.add_argument("--save", type=str, help="Save path")
+    parser_eval.add_argument(
+        "--gptq-nsamples", type=int, default=128,
+        help="WikiText-2 sequences for online GPTQ. Low-bit configs use 128; "
+        "the historical n256 prequant maps are a different recipe.",
+    )
+    parser_eval.add_argument(
+        "--device-map", type=str, default=None,
+        help="cpu: keep the model on CPU and move one decoder layer onto the visible GPU during GPTQ.",
+    )
+    parser_eval.add_argument(
+        "--skip-eval", action="store_true",
+        help="Stop after in-place quantization. --save writes a quant report, not task scores.",
+    )
+    parser_eval.add_argument(
+        "--save-model", type=str, default=None,
+        help="With --skip-eval, write the fake-quant HF tree (safetensors) to this directory.",
+    )
     # Single-GPU fit: accelerate device_map="auto" + max_memory (layer placement / CPU spill).
     # Example 3090 (24GB): --max-gpu-memory 16GiB --max-cpu-memory 64GiB
     # Keep ~8GiB free for activations: 4k-token PPL logits on a 151k vocab need ~5GiB+.
@@ -823,6 +1083,8 @@ if __name__ == "__main__":
         }
 
     ori_wcfg = (16,-1)
+    if args.sub == "eval" and args.qconfig:
+        _assert_qconfig_matches_weight_map(args.qconfig)
     # Calib layer_out_norm streams one decoder layer to cuda:0; keep weights on CPU so
     # qwen2_moe (~28GiB bf16) + float64 activation buffers fit on 40GB A100s.
     # (Hand layerwise calib path; not the accelerate fit-map used by eval placement.)
@@ -834,6 +1096,18 @@ if __name__ == "__main__":
             attn_implementation="flash_attention_2",
             trust_remote_code=True,
             torch_dtype="auto",
+            device_map="cpu",
+        )
+    elif args.sub == "eval" and args.device_map == "cpu":
+        # Whole-model GPU residency (ds2 ~29GiB, qwen2_moe ~27GiB) plus GPTQ
+        # Hessians does not leave a safe margin on a 40GB A100. Same placement
+        # as export_gptq_hf: weights stay on CPU, one layer visits the GPU.
+        print(">>> load model to CPU (one decoder layer at a time on the visible GPU)")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            attn_implementation="flash_attention_2",
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
             device_map="cpu",
         )
     else:
@@ -881,9 +1155,21 @@ if __name__ == "__main__":
 
             logger.info(f">>> Build Qmodel from Qconfig: {args.qconfig}")
             logger.info(f">>> Pre-Quantized weight: {all_bits}")
+            logger.info(
+                f">>> Online GPTQ nsamples={args.gptq_nsamples} "
+                "(low-bit recipe is 128; n256 prequant maps are not loaded unless --qweight is set)"
+            )
 
+            # --qweight is the only switch that loads the n256 maps. Leave it unset
+            # for the 128-sample low-bit recipe so GPTQ runs online.
             pre_quantized_weight = None if args.qweight is None else qweight_map
-            model_quantizer = MoeModelQuantizer(model, model_id, qmethod, pre_quantized_weight=pre_quantized_weight, ori_wcfg=ori_wcfg, online_had=args.online_had)
+            model_quantizer = MoeModelQuantizer(
+                model, model_id, qmethod,
+                pre_quantized_weight=pre_quantized_weight,
+                ori_wcfg=ori_wcfg,
+                online_had=args.online_had,
+                gptq_nsamples=args.gptq_nsamples,
+            )
             qmodel = model_quantizer.quant_model(qmodel_config)
         elif args.qstr is not None:
             assert args.qconfig is None
@@ -901,10 +1187,26 @@ if __name__ == "__main__":
             logger.info(f">>> Build Qmodel from uni-Qconfig: {qstr}")
 
             pre_quantized_weight = None if args.qweight is None else args.qweight
-            model_quantizer = MoeModelQuantizer(model, model_id, qmethod, ori_wcfg=ori_wcfg, pre_quantized_weight=pre_quantized_weight, online_had=args.online_had)
+            model_quantizer = MoeModelQuantizer(
+                model, model_id, qmethod,
+                ori_wcfg=ori_wcfg,
+                pre_quantized_weight=pre_quantized_weight,
+                online_had=args.online_had,
+                gptq_nsamples=args.gptq_nsamples,
+            )
             qmodel = model_quantizer.quant_model(qmodel_config)
         else:
             qmodel = model
+            model_quantizer = None
+
+        if args.skip_eval:
+            if model_quantizer is None:
+                raise SystemExit("--skip-eval requires --qconfig or --qstr")
+            _write_quant_report_and_maybe_save(
+                args, model_quantizer, qmodel, tokenizer, model_id, model_name, quant_type, logger,
+            )
+            print("[quant] DONE skip-eval", flush=True)
+            exit(0)
 
         evaluator = Evaluator(tokenizer, model_id)
         eval_res = {}

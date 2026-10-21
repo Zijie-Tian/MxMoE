@@ -39,6 +39,7 @@ Project workflows are **Rhai orchestration scripts** under `.grok/workflows/`. T
 | `setup-mxmoe-env` | `.grok/workflows/setup-mxmoe-env.rhai` | Create/use conda env `mxmoe`, install smoke Python deps (skip flash by default), init submodules / hadamard, arch prep, L0–L2 ending in `run_mxmoe_gg` FP16 bench |
 | `install-flash-lmeval` | `.grok/workflows/install-flash-lmeval.rhai` | Compile-install `flash_attn` and install `lm_eval` into `mxmoe`, then verify FA2 + project `Evaluator` / lm_eval |
 | `reproduce-acc` | `.grok/workflows/reproduce-acc.rhai` | **Accuracy-only** multi-GPU path for any `ID2NAME` MoE: required `model_id`+`model_path`; pins `gpu_a/b/c` so **calib A‖B** (and baseline on `gpu_c`) run in parallel; then ILP + MxMoE eval; **no** kernel/`run_mxmoe_gg` |
+| `quant-lowbit-gptq-had` | `.grok/workflows/quant-lowbit-gptq-had.rhai` | **Quant-only** online GPTQ-Had for the 12 solved `ds2` / `qwen2_moe` qconfigs (BPV 2.25/3.25, R=0/0.5/1). One GPU per model, six configs sequential. No ILP, no calib, no PPL, no kernel |
 
 (User-level workflows under `~/.grok/workflows/` are separate and not listed here.)
 
