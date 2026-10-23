@@ -457,16 +457,8 @@ def main(argv=None) -> None:
     print(f"[export] root={EXPORT_HF_ROOT}")
     print(f"[export] → {export_dir}")
 
-    if args.model in ["qwen2_moe_57b", "mixtral"] or args.device_map == "cpu":
-        model = AutoModelForCausalLM.from_pretrained(
-            ID2NAME[args.model],
-            trust_remote_code=True,
-            torch_dtype="auto",
-            device_map="cpu",
-            attn_implementation="flash_attention_2",
-        )
-    else:
-        model = load_hf_model(args.model)
+    device_map = "cpu" if args.model in ["qwen2_moe_57b", "mixtral"] or args.device_map == "cpu" else None
+    model = load_hf_model(args.model, device_map=device_map)
 
     tokenizer = load_tokenizer(args.model)
     trainloader, _ = get_wikitext2(

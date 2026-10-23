@@ -1,14 +1,15 @@
 // quant-lowbit-gptq-had: Experiment-only online GPTQ-Had for the 12 solved
 // mixed-precision qconfigs (ds2 and qwen2_moe; BPV 2.25 and 3.25; R=0, 0.5, 1).
 // Does not re-solve ILP, re-run calibration, call export_gptq_hf, run PPL or
-// zero-shot, or bench kernels. One physical GPU per model; that model's six
-// configs run one after another. Side effects: conda env mxmoe, two GPUs,
-// fake-quant HF trees under save_root. Reports are scratch only.
+// zero-shot, or bench kernels. Shared environment is conda env mxmoe on CUDA 13.0
+// (doc/environment.md). Does not install packages or use another env.
+// One physical GPU per model; that model's six configs run one after another.
+// Side effects: two GPUs, fake-quant HF trees under save_root. Reports are scratch only.
 //
-// Args (all optional; defaults match the 2026-10-16 config package on this node):
-//   env_name        default "mxmoe"
-//   cuda_home       default "/usr/local/cuda-12.4"
-//   config_root     default "<repo>/outputs/lowbit_allocations_20261016/mxmoe_lowbit_configs_12"
+// Args (all optional; recipe defaults match the 2026-10-16 config package):
+//   env_name        default "mxmoe" (any other value is rejected)
+//   cuda_home       default "" (resolve CUDA 13.0; never 12.4 or newest cuda*)
+//   config_root     default "outputs/lowbit_allocations_20261016/mxmoe_lowbit_configs_12"
 //   save_root       default "/mnt/raid/tzj/mxmoe/lowbit_gptq_had_20261016"
 //   gpu_ds2         default "0"     (only ds2; never share with qwen2_moe)
 //   gpu_qwen        default "1"     (only qwen2_moe)
@@ -21,10 +22,10 @@
 
 let meta = #{
     name: "quant-lowbit-gptq-had",
-    description: "Online GPTQ-Had for the 12 solved ds2 and qwen2_moe low-bit qconfigs, one GPU per model, no ILP and no accuracy eval",
-    when_to_use: "When the low-bit allocation package is already solved and you need to quantize those qconfigs into fake-quant HF trees",
+    description: "Quant-only online GPTQ-Had in conda env mxmoe on CUDA 13.0 for the 12 solved ds2 and qwen2_moe low-bit qconfigs, one GPU per model, no ILP and no accuracy eval",
+    when_to_use: "When the low-bit allocation package is already solved and those qconfigs should be quantized on the shared mxmoe stack",
     phases: [
-        #{ title: "Precheck", detail: "conda, checkpoints, config checksums, two distinct GPUs" },
+        #{ title: "Precheck", detail: "mxmoe, CUDA 13.0, checkpoints, config checksums, two distinct GPUs" },
         #{ title: "Quant", detail: "ds2 on gpu_ds2 || qwen2_moe on gpu_qwen; six configs sequential per GPU" },
         #{ title: "Report", detail: "scratch summary of BPV, peaks, and save paths" },
     ],
@@ -64,8 +65,8 @@ fn quant_prompt(model_id, gpu_id, skip_note, preamble, budgets, r_values, nsampl
     p += "  R directory names are r0, r0.5, r1 (not r0.0).\n";
     p += "  save_dir = <save_root>/" + model_id + "/bpv<B>_r<R>\n";
     p += "  log = <repo>/log/quant_lowbit_" + model_id + "_bpv<B>_r<R>_gpu" + gpu_id + ".log\n";
-    p += "Command, from the repo root, after conda activate:\n";
-    p += "  CUDA_VISIBLE_DEVICES=" + gpu_id + " python -m mxmoe.quant.quant eval \\\n";
+    p += "Command, from the repo root, with the mxmoe interpreter:\n";
+    p += "  CUDA_VISIBLE_DEVICES=" + gpu_id + " conda run --no-capture-output -n mxmoe python -m mxmoe.quant.quant eval \\\n";
     p += "    --model " + model_id + " --method gptq-had \\\n";
     p += "    --qconfig <qconfig> --gptq-nsamples " + nsamples + " --seed " + seed + " \\\n";
     p += "    --device-map cpu --skip-eval \\\n";
@@ -82,7 +83,7 @@ fn quant_prompt(model_id, gpu_id, skip_note, preamble, budgets, r_values, nsampl
 }
 
 let env_name = arg_str(args, "env_name", "mxmoe");
-let cuda_home = arg_str(args, "cuda_home", "/usr/local/cuda-12.4");
+let cuda_home = arg_str(args, "cuda_home", "");
 let config_root = arg_str(args, "config_root", "outputs/lowbit_allocations_20261016/mxmoe_lowbit_configs_12");
 let save_root = arg_str(args, "save_root", "/mnt/raid/tzj/mxmoe/lowbit_gptq_had_20261016");
 let gpu_ds2 = arg_str(args, "gpu_ds2", "0");
@@ -94,6 +95,9 @@ let r_values = arg_str(args, "r_values", "0,0.5,1");
 let skip_existing = arg_bool(args, "skip_existing", true);
 let skip_quant = arg_bool(args, "skip_quant", false);
 
+if env_name != "mxmoe" {
+    pause("infra", "Refusing env_name='" + env_name + "'. This quant workload uses conda env mxmoe only.");
+}
 if gpu_ds2 == gpu_qwen {
     pause("infra", "gpu_ds2 and gpu_qwen must be two different physical GPU ids. One GPU runs one model.");
 }
@@ -106,15 +110,19 @@ let step_schema = #{
         "summary": #{ "type": "string" },
         "details": #{ "type": "string" },
         "artifact_path": #{ "type": "string" },
-        "log_tail": #{ "type": "string" },
+        "cuda_release": #{ "type": "string" },
     },
 };
 
 let preamble = "";
-preamble += "Use isolated conda env `" + env_name + "` only.\n";
-preamble += "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate " + env_name + "\n";
-preamble += "export CUDA_HOME=" + cuda_home + "\n";
-preamble += "export PATH=$CUDA_HOME/bin:$PATH\n";
+preamble += "REQUIRED environment: conda env mxmoe only. See doc/environment.md. Do not install packages or use another env.\n";
+preamble += "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate mxmoe\n";
+preamble += "Python is that interpreter. Quant commands use conda run --no-capture-output -n mxmoe python -m ...\n";
+preamble += "Resolve CUDA 13.0 before any GPU command. Supplied cuda_home arg: '" + cuda_home + "'.\n";
+preamble += "If that arg is non-empty, it is the only candidate and its nvcc must be 13.0. Refuse 12.4 and 13.1.\n";
+preamble += "If it is empty, do not export an empty CUDA_HOME and do not keep an inherited 12.4 or 13.1 value.\n";
+preamble += "Use process CUDA_HOME only when its nvcc is 13.0; else /usr/local/cuda-13.0 when that nvcc is 13.0. Never pick the newest cuda directory.\n";
+preamble += "Then export PATH=$CUDA_HOME/bin:$PATH and LD_LIBRARY_PATH from $CUDA_HOME/lib64 (or lib if lib64 is absent).\n";
 preamble += "cd the MxMoE git toplevel (git rev-parse --show-toplevel). export PYTHONPATH=$PWD:$PYTHONPATH\n";
 preamble += "export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=8\n";
 preamble += "config_root=" + config_root + " (if relative, resolve under the repo root).\n";
@@ -136,15 +144,16 @@ let pre_p = "";
 pre_p += "Precheck only. Do not start quantization.\n";
 pre_p += preamble;
 pre_p += "Run these checks with the shell. ok=true only if every one exits 0.\n";
-pre_p += "1) conda env " + env_name + " imports torch (CUDA), transformers, fast_hadamard_transform.\n";
-pre_p += "2) python project_config.py --check ds2 qwen2_moe exits 0. Do not rewrite .env.\n";
+pre_p += "1) mxmoe only: Python 3.12, torch 2.13.0+cu130, torch.version.cuda 13.0, nvcc release 13.0, transformers 5.19.0, fast_hadamard_transform imports. Do not pip install. Set cuda_release to that nvcc release.\n";
+pre_p += "2) conda run --no-capture-output -n mxmoe python project_config.py --check ds2 qwen2_moe exits 0. Do not rewrite .env.\n";
 pre_p += "3) config_root contains README.txt, provenance.json, summary.csv, SHA256SUMS, and these 12 files:\n";
 pre_p += "   ds2 and qwen2_moe; bpv2.25 and bpv3.25; r0, r0.5, r1; each with qconfig.json and expert_weight_map.json.\n";
 pre_p += "4) In config_root run: sha256sum -c SHA256SUMS. All listed files must be OK.\n";
 pre_p += "5) nvidia-smi: GPU " + gpu_ds2 + " and GPU " + gpu_qwen + " exist and are different devices.\n";
 pre_p += "   Record used/free MiB. A busy GPU is allowed when the only compute process is an existing mxmoe.quant.quant for that same model.\n";
 pre_p += "6) Confirm mxmoe/quant/quant.py eval accepts --gptq-nsamples, --device-map, --skip-eval, and --save-model.\n";
-pre_p += "summary: one line. details: checksum result, both checkpoint paths, both GPU free MiB.\n";
+pre_p += "summary: one line. details: checksum result, both checkpoint paths, both GPU free MiB, resolved save_root.\n";
+pre_p += "artifact_path: the resolved save_root. cuda_release must be 13.0 or ok=false.\n";
 
 let pre = agent(pre_p, #{
     label: "precheck",
@@ -157,6 +166,9 @@ if pre == () || !pre.success || pre.output == () || pre.output.ok != true {
         why = pre.output.summary;
     }
     pause("infra", why);
+}
+if pre.output.cuda_release != "13.0" {
+    pause("infra", "Precheck CUDA is not 13.0. Refusing 12.4, 13.1, or an unresolved toolkit.");
 }
 log("Precheck OK: " + pre.output.summary);
 
@@ -233,7 +245,14 @@ let report = "";
 report += "# quant-lowbit-gptq-had\n\n";
 report += "Scope: online GPTQ-Had fake-quant only. No ILP, no calibration, no PPL, no kernel bench.\n\n";
 report += "config_root: " + config_root + "\n\n";
-report += "save_root: " + save_root + "\n\n";
+report += "env: mxmoe  CUDA: 13.0\n\n";
+if pre.output.artifact_path != () && pre.output.artifact_path != "" {
+    report += "save_root: " + pre.output.artifact_path + "\n\n";
+} else if save_root != "" {
+    report += "save_root: " + save_root + "\n\n";
+} else {
+    report += "save_root: $MXMOE_LOWBIT_SAVE_ROOT\n\n";
+}
 report += "gpus: ds2=" + gpu_ds2 + " qwen2_moe=" + gpu_qwen + "\n\n";
 report += "nsamples: " + nsamples + " seed: " + seed + "\n\n";
 report += "budgets: " + budgets + " R: " + r_values + "\n\n";

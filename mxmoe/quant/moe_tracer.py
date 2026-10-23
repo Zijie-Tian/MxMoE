@@ -75,11 +75,14 @@ class MoETracer:
 
     @staticmethod
     def mixtral_gate_hook(m: nn.Module, inp, out, top_k: int, norm_topk_prob: bool, topk_idx: list, topk_weight: list):
-        router_logits = out
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-        if norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)  # re-normalize
+        if isinstance(out, tuple):
+            _logits, routing_weights, selected_experts = out
+        else:
+            router_logits = out
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+            if norm_topk_prob:
+                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         topk_idx.append(selected_experts.cpu())
         topk_weight.append(routing_weights.cpu())
 
@@ -100,7 +103,7 @@ class MoETracer:
                 )
                 self.gate_hook_handle.append(moe_gate.register_forward_hook(moe_gate_hook))
             elif self.model_config.model_type == "mixtral":
-                moe: nn.Module = layer.block_sparse_moe
+                moe: nn.Module = layer.mlp
                 moe_gate: nn.Module = moe.gate
 
                 moe_gate_hook = partial(

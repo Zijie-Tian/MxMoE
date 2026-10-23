@@ -1,0 +1,23 @@
+# Core performance pins for the mxmoe conda env (Python 3.12).
+# requirements.txt applies this file. Do not relax these pins.
+#
+# Versions were read from installed mxmoe distributions (importlib.metadata)
+# and match the proven cu130 upgrade pin set, plus triton (verified 3.7.1).
+# Constraints do not install packages by themselves.
+#
+# In this env's packaging, 2.13.0+cu130 satisfies ==2.13.0 and sorts above
+# 2.13.0. The local-version pins stop a default-index Torch wheel.
+
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130
+torchaudio==2.11.0+cu130
+torchcodec==0.14.0+cu130
+triton==3.7.1
+transformers==5.19.0
+huggingface-hub==1.31.0
+accelerate==1.13.0
+numpy==2.2.6
+cuda-bindings==13.0.3
+cuda-python==13.0.3
+nvidia-nvjitlink==13.0.88
+openai==2.44.0

@@ -35,18 +35,16 @@ We explore the automated design of mixed-precision quantization scheme for MoE m
 
 ## 🛠️ Usage
 
-1. Pre-requirement
+1. Configure the shared environment:
+
+    Follow the [MxMoE environment guide](doc/environment.md) for the unified
+    `mxmoe` Conda environment, CUDA toolchain, and source-built extensions.
+    **Accuracy and performance use the same stack**, including the local
+    editable `3rdparty/vllm`; do not install a separate legacy accuracy stack.
+    After setup, activate it before running the examples below:
 
     ```bash
-    # 0. virtual env
-    conda create -n mxmoe python=3.12 -y
-
-    # 1. source code dependencies
-    git submodule update --init --recursive
-
-    # 2. python package dependencies
-    pip install -r requirements.txt
-    cd mxmoe/3rdparty/fast-hadamard-transform && pip install . && cd -
+    conda activate mxmoe
     ```
 
 2. View the activation statistic of MoE models:

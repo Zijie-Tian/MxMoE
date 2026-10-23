@@ -2,6 +2,53 @@ import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
 
+class _LinearExpert(nn.Module):
+    """Expose packed HF weights as real linears for GPTQ and activation hooks."""
+
+    def __init__(self, packed, expert_idx, names):
+        super().__init__()
+        self.projection_names = names
+        self.act_fn = packed.act_fn
+        fused = packed.gate_up_proj[expert_idx].detach()
+        midpoint = fused.shape[0] // 2
+        projections = (
+            fused[:midpoint].clone(),
+            fused[midpoint:].clone(),
+            packed.down_proj[expert_idx].detach().clone(),
+        )
+        for name, weight in zip(names, projections):
+            linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False, device=weight.device, dtype=weight.dtype)
+            linear.weight = nn.Parameter(weight, requires_grad=False)
+            self.add_module(name, linear)
+
+    def forward(self, hidden_states):
+        gate, up, down = (getattr(self, name) for name in self.projection_names)
+        return down(self.act_fn(gate(hidden_states)) * up(hidden_states))
+
+
+class _LinearExperts(nn.ModuleList):
+    """Preserve HF routing while each expert projection executes its own hooks."""
+
+    def __init__(self, packed, names):
+        experts = [_LinearExpert(packed, i, names) for i in range(packed.num_experts)]
+        del packed.gate_up_proj, packed.down_proj
+        super().__init__(experts)
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        result = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            mask = torch.nn.functional.one_hot(top_k_index, num_classes=len(self) + 1).permute(2, 1, 0)
+            active = mask.sum(dim=(-1, -2)).nonzero().flatten()
+        for expert_idx in active:
+            if expert_idx == len(self):
+                continue
+            slot, token = torch.where(mask[expert_idx])
+            output = self[int(expert_idx)](hidden_states[token])
+            output = output * top_k_weights[token, slot, None]
+            result.index_add_(0, token, output.to(result.dtype))
+        return result
+
+
 @torch.no_grad()
 def move_weight_to_cpu(model: PreTrainedModel, layer_idx: int = -1) -> list[dict[str, torch.Tensor]]:
     weights = [{} for _ in range(len(model.model.layers))]
@@ -49,6 +96,11 @@ def get_linear_block_weight(model_id:str, model_weight: dict|PreTrainedModel, la
     else:
         mlp_weight_key = f"{mlp_block_name}.experts.{expert_idx}.{linear_block_name}"
 
+        if model_id == "mixtral" and f"model.layers.{layer_idx}.{mlp_weight_key}.weight" not in model_weight:
+            # Older prequantized dictionaries retain the original checkpoint prefix.
+            original_key = mlp_weight_key.replace("mlp.", "block_sparse_moe.", 1)
+            if f"model.layers.{layer_idx}.{original_key}.weight" in model_weight:
+                mlp_weight_key = original_key
         # handle the shared expert
         if model_weight.get(f"model.layers.{layer_idx}.{mlp_weight_key}.weight", None) is None:
             if model_id == "ds2":
@@ -102,27 +154,24 @@ def get_expert_linears(model: PreTrainedModel, layer_idx: int = -1, exclude_non_
     experts = [[] for _ in range(len(model.model.layers))]
     model_type = model.config.model_type
 
+    if model_type not in ("deepseek_v2", "mixtral", "qwen2_moe"):
+        raise NotImplementedError(f"Unsupported model type: {model_type}")
+    names = ("w1", "w3", "w2") if model_type == "mixtral" else ("gate_proj", "up_proj", "down_proj")
     for layer_i, layer in enumerate(model.model.layers):
-        if layer_idx != -1 and layer_idx != layer_i: continue
+        if layer_idx != -1 and layer_idx != layer_i:
+            continue
+        block = layer.mlp
+        if not hasattr(block, "experts"):
+            if not exclude_non_moe_layer:
+                experts[layer_i].append(block)
+            continue
+        if hasattr(block.experts, "gate_up_proj"):
+            block.experts = _LinearExperts(block.experts, names)
+        experts[layer_i].extend(block.experts)
         if model_type == "deepseek_v2":
-            # non-moe layer
-            if layer_i == 0 and not exclude_non_moe_layer:
-                experts[layer_i].append(layer.mlp)
-                continue
-
-            for expert in layer.mlp.experts:
-                experts[layer_i].append(expert)
-            experts[layer_i].append(layer.mlp.shared_experts)
-
-        elif model_type == "mixtral":
-            for expert in layer.block_sparse_moe.experts:
-                experts[layer_i].append(expert)
+            experts[layer_i].append(block.shared_experts)
         elif model_type == "qwen2_moe":
-            for expert in layer.mlp.experts:
-                experts[layer_i].append(expert)
-            experts[layer_i].append(layer.mlp.shared_expert)
-        else:
-            raise NotImplementedError(f"Unsupported model type: {model_type}")
+            experts[layer_i].append(block.shared_expert)
     if layer_idx != -1:
         experts = experts[layer_idx]
     return experts
@@ -136,23 +185,14 @@ def get_moe_gate_linears(model: PreTrainedModel, layer_idx: int = -1) -> list[nn
 
     for layer_i, layer in enumerate(model.model.layers):
         if layer_idx != -1 and layer_idx != layer_i: continue
-        if model_type == "deepseek_v2":
-            # non-moe layer
-            if layer_i == 0:
-                continue
-
-            gate = getattr(layer.mlp, "gate", None)
-            if gate is not None: expert_gates[layer_i].append(gate.weight)
-        elif model_type == "mixtral":
-            gate = getattr(layer.block_sparse_moe, "gate", None)
-            if gate is not None: expert_gates[layer_i].append(gate)
-        elif model_type == "qwen2_moe":
-            gate = getattr(layer.mlp, "gate", None)
-            if gate is not None: expert_gates[layer_i].append(gate)
-            shared_expert_gate = getattr(layer.mlp, "shared_expert_gate", None)
-            if shared_expert_gate is not None: expert_gates[layer_i].append(shared_expert_gate)
-        else:
+        if model_type not in ("deepseek_v2", "mixtral", "qwen2_moe"):
             raise NotImplementedError(f"Unsupported model type: {model_type}")
+        if not hasattr(layer.mlp, "experts"):
+            continue
+        # Transformers 5 routers are not nn.Linear; rotate their projection parameter.
+        expert_gates[layer_i].append(layer.mlp.gate.weight)
+        if model_type == "qwen2_moe":
+            expert_gates[layer_i].append(layer.mlp.shared_expert_gate)
     if layer_idx != -1:
         expert_gates = expert_gates[layer_idx]
     return expert_gates
@@ -191,7 +231,7 @@ MOE_MLP_NAME_MAP = {
     "ds2": "mlp",
     "qwen2_moe": "mlp",
     "qwen2_moe_57b": "mlp",
-    "mixtral": "block_sparse_moe",
+    "mixtral": "mlp",
 }
 MOE_WEIGHT_NAME_MAP = {
     **dict.fromkeys(["ds2", "qwen2_moe", "qwen2_moe_57b"], {
@@ -331,10 +371,26 @@ def resolve_device_map(
     return get_device_map(model_id)
 
 
+def _normalize_legacy_tied_keys(module: nn.Module) -> None:
+    """Transformers 5 expects ``_tied_weights_keys`` to be a dict, not a list."""
+    tied = getattr(module, "_tied_weights_keys", None)
+    if isinstance(tied, list):
+        module._tied_weights_keys = {key: key for key in tied}
+    for child in module.children():
+        _normalize_legacy_tied_keys(child)
+
+
+def _install_remote_code_shims() -> None:
+    """DeepSeek-V2-Lite remote code imports symbols removed in Transformers 5."""
+    import transformers.utils.import_utils as import_utils
+
+    if not hasattr(import_utils, "is_torch_fx_available"):
+        import_utils.is_torch_fx_available = lambda: False
+
+
 def load_hf_model(
     model_id: str,
     ckpt=None,
-    rotation=False,
     dtype="auto",
     *,
     device_map: str | dict | None = None,
@@ -342,68 +398,61 @@ def load_hf_model(
     offload_folder: str | None = None,
     offload_buffers: bool = False,
 ):
-    """Load a HF causal LM with accelerate layer placement.
+    """Load native HF models, expose expert linears, then dispatch with accelerate.
 
-    Single-GPU OOM mitigation: pass ``max_memory`` from :func:`build_max_memory`
-    (and optionally ``offload_folder`` for disk spill). Do **not** ``.to()`` the
-    whole model or individual layers after load — that breaks the map.
-
-    Note: calib ``layer_out_norm`` / online GPTQ hand layerwise paths are out of
-    scope for this placement mode; they still use their own CPU + per-layer logic.
-    In-place weight edits (RTN fake-quant, ``substitue_moe_weights``) on
-    CPU/disk-offloaded layers are silently dropped: accelerate hooks restore the
-    original weights from their side map at every forward.
+    HF converts original or packed checkpoints on CPU before expert unpacking.
+    Offload hooks are installed only after the module layout is final. Host RAM
+    must fit the float weights; quantization uses its separate per-layer GPU path.
     """
     from project_config import ID2NAME
     from transformers import AutoModelForCausalLM, AutoConfig
-    from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
-    from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeDecoderLayer
+    from accelerate import dispatch_model, infer_auto_device_map
 
-    from accelerate import load_checkpoint_and_dispatch, init_empty_weights
-    from mxmoe.quant.rotation import fuse_layer_norms
-
-    model_name = ID2NAME[model_id]
-
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-
-    with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(
-            config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True,
-        )
-    if rotation:
-        print("Fusing Layer norm ...")
-        fuse_layer_norms(model)
+    remote = model_id == "ds2"
+    if remote:
+        _install_remote_code_shims()
+    model_name = ckpt if ckpt is not None else ID2NAME[model_id]
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=remote)
+    # Native Qwen/Mixtral checkpoints may still advertise obsolete remote code.
+    # DeepSeek-V2-Lite must retain its auto_map and modeling_deepseek.py.
+    if not remote:
+        config.__dict__.pop("auto_map", None)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        config=config,
+        dtype=dtype,
+        # Remote DeepSeek-V2 does not declare `_supports_flash_attn`, so
+        # Transformers 5 rejects FA2. Its own attention implementation still runs.
+        attn_implementation="eager" if remote else "flash_attention_2",
+        trust_remote_code=remote,
+        device_map="cpu",
+    )
+    if remote:
+        _normalize_legacy_tied_keys(model)
+    get_expert_linears(model)
 
     resolved_map = resolve_device_map(model_id, device_map=device_map, max_memory=max_memory)
-    ckpt = ckpt if ckpt is not None else model_name
+    if isinstance(resolved_map, str):
+        if resolved_map in ("auto", "balanced", "balanced_low_0", "sequential"):
+            from accelerate.utils import get_balanced_memory
 
-    dispatch_kwargs = dict(
-        model=model,
-        checkpoint=ckpt,
-        device_map=resolved_map,
-        # accelerate compares class *names* (str) here; passing classes silently
-        # disables no_split and lets decoder layers be split mid-expert.
-        no_split_module_classes=[
-            MixtralDecoderLayer.__name__,
-            Qwen2MoeDecoderLayer.__name__,
-        ],
+            no_split = model._no_split_modules
+            if resolved_map != "sequential":
+                max_memory = get_balanced_memory(
+                    model, max_memory=max_memory, no_split_module_classes=no_split,
+                    dtype=next(model.parameters()).dtype,
+                    low_zero=resolved_map == "balanced_low_0",
+                )
+            resolved_map = infer_auto_device_map(
+                model, max_memory=max_memory, no_split_module_classes=no_split,
+                dtype=next(model.parameters()).dtype, offload_buffers=offload_buffers,
+            )
+        else:
+            resolved_map = {"": resolved_map}
+    model = dispatch_model(
+        model, device_map=resolved_map, offload_dir=offload_folder,
         offload_buffers=offload_buffers,
     )
-    if max_memory is not None:
-        dispatch_kwargs["max_memory"] = max_memory
-    if offload_folder is not None:
-        dispatch_kwargs["offload_folder"] = offload_folder
-
-    if max_memory is not None or offload_folder is not None:
-        print(
-            f"[load_hf_model] accelerate placement: device_map={resolved_map!r}, "
-            f"max_memory={max_memory}, offload_folder={offload_folder}"
-        )
-
-    model = load_checkpoint_and_dispatch(**dispatch_kwargs)
 
     hf_map = getattr(model, "hf_device_map", None)
     if hf_map is not None:
@@ -421,4 +470,4 @@ def load_tokenizer(model_id: str):
     from transformers import AutoTokenizer
 
     model_name = ID2NAME[model_id]
-    return AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)

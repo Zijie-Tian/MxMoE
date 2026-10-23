@@ -578,27 +578,13 @@ def gptq_param_parser():
 
 if __name__ == '__main__':
     from project_config import ID2NAME
-    from transformers import AutoModelForCausalLM
     parser = gptq_param_parser()
     args = parser.parse_args()
     transformers.set_seed(args.seed)
 
     model_id = args.model
-
-    # model = load_hf_model(model_id)
-
-    if model_id in ["qwen2_moe_57b", "mixtral"]:
-        print(f">>> load model to CPU")
-        model_name = ID2NAME[model_id]
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True,
-            torch_dtype="auto",
-            device_map="cpu",
-        )
-    else:
-        model = load_hf_model(model_id)
+    device_map = "cpu" if model_id in ["qwen2_moe_57b", "mixtral"] else None
+    model = load_hf_model(model_id, device_map=device_map)
     tokenizer = load_tokenizer(model_id)
     trainloader, testloader = get_wikitext2(args.nsamples, args.seed, 4096, tokenizer, model_id)
 

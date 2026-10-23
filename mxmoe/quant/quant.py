@@ -1088,28 +1088,11 @@ if __name__ == "__main__":
     # Calib layer_out_norm streams one decoder layer to cuda:0; keep weights on CPU so
     # qwen2_moe (~28GiB bf16) + float64 activation buffers fit on 40GB A100s.
     # (Hand layerwise calib path; not the accelerate fit-map used by eval placement.)
-    if model_id in ["qwen2_moe", "qwen2_moe_57b", "mixtral"] and args.sub == "calib":
-        print(f">>> load model to CPU (calib sequential layer offload)")
-        model_name = ID2NAME[model_id]
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True,
-            torch_dtype="auto",
-            device_map="cpu",
-        )
-    elif args.sub == "eval" and args.device_map == "cpu":
-        # Whole-model GPU residency (ds2 ~29GiB, qwen2_moe ~27GiB) plus GPTQ
-        # Hessians does not leave a safe margin on a 40GB A100. Same placement
-        # as export_gptq_hf: weights stay on CPU, one layer visits the GPU.
-        print(">>> load model to CPU (one decoder layer at a time on the visible GPU)")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map="cpu",
-        )
+    if (model_id in ["qwen2_moe", "qwen2_moe_57b", "mixtral"] and args.sub == "calib") or (
+        args.sub == "eval" and args.device_map == "cpu"
+    ):
+        print(">>> load native model to CPU (one decoder layer at a time on the visible GPU)")
+        model = load_hf_model(model_id, device_map="cpu")
     else:
         # Eval (and small-model calib): optional accelerate GPU+CPU layer placement.
         max_memory = None

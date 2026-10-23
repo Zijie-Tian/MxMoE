@@ -1,11 +1,18 @@
 # MxMoE project agent notes
 
-## Documentation policy (`docs/`)
+## Unified environment — MANDATORY
 
-- **Do not** use `docs/` (or other in-repo markdown) to record environment setup, package installs, conda/CUDA configuration, machine-local paths, or similar ops/runbooks.
-- Those notes belong in chat replies, workflow scratch artifacts, or the user's own notes — **not** committed project docs.
-- **`docs/` is reserved for documenting intentional source/code changes** (design notes for code, API behavior changes, algorithm/kernel modifications, PR-oriented change logs). Prefer short, code-linked notes over install diaries.
-- Do not create files such as `docs/setup-*-report.md`, `docs/install-*-report.md`, or similar environment reports under this repo.
+- **Accuracy and performance use the same Conda environment `mxmoe`, configured with the performance/source-build stack.** This includes calibration, GPTQ, evaluation, all tests, CUDA kernels, and `3rdparty/vllm`; do not create a legacy accuracy environment or a separate `.venv`.
+- Follow **[`doc/environment.md`](doc/environment.md)** for installation and verification. Root `requirements.txt` and `constraints.txt` define the shared Python dependencies; build Hadamard, FlashAttention, and local editable vLLM against that stack. Do not downgrade Torch/Transformers for accuracy work.
+- Use `conda run --no-capture-output -n mxmoe python ...` or explicitly activate `mxmoe` before running commands. Never rely on whichever environment the shell inherited.
+- Build native extensions and install dependencies with that Python (`python -m pip`), applying the root constraints. Never substitute `base`, `bitmoe`, another project environment, or system Python. Rebuild extensions after changing the Torch/CUDA ABI.
+- Installation/import checks are not inference or performance validation. Report kernel execution, `LLM.generate`, and benchmark results separately; never infer them from a successful build.
+
+## Documentation policy (`doc/`, `docs/`)
+
+- **`doc/environment.md` is the user-requested, maintained environment configuration guide.** Keep it aligned with dependency files and installation workflows; document the single shared environment, not accuracy/performance alternatives.
+- Keep machine-local checkpoint paths, credentials, build-cache locations, installation logs, and per-machine reports out of tracked documentation. Use `.env` for model paths and shell variables/scratch artifacts for build configuration and logs.
+- Other `docs/` content remains reserved for intentional source/code changes. Do not add setup/install diaries or duplicate environment runbooks.
 
 ## Machine-local config (`.env`) — MANDATORY
 
@@ -21,14 +28,14 @@ Keys: `MXMOE_MODEL_DS2`, `MXMOE_MODEL_MIXTRAL`, `MXMOE_MODEL_QWEN2_MOE`, `MXMOE_
 
 ## Workflows (`.grok/workflows/`)
 
-Project workflows are **Rhai orchestration scripts** under `.grok/workflows/`. They automate multi-step agent pipelines for this repo (env bring-up, optional package compile, smoke verification, later experiment stages). They are **not** part of the scientific code path; they exist so setup and repeatable checks can run in the background with a clear phase rail.
+Project workflows are **Rhai orchestration scripts** under `.grok/workflows/`. They automate shared-environment bring-up, extension builds, smoke verification, and later experiments. They are **not** part of the scientific code path; all use the same `mxmoe` environment documented above.
 
 ### Role in this project
 
 | Purpose | Notes |
 |---------|--------|
-| Machine / env bring-up | Isolated conda env, CUDA toolchain, deps |
-| Optional heavy installs | e.g. compile `flash_attn`, install `lm_eval` |
+| Machine / env bring-up | Unified `mxmoe` performance stack for accuracy and performance |
+| Extension install / rebuild | Hadamard, FlashAttention, source-editable vLLM; shared accuracy dependencies |
 | Smoke gates | Imports, CUDA, kernel codegen/build/bench without inventing paper results |
 | Ops reporting | Prefer **workflow run result + scratch files**; never install diaries under `docs/` |
 
@@ -36,10 +43,10 @@ Project workflows are **Rhai orchestration scripts** under `.grok/workflows/`. T
 
 | Name | Path | What it does |
 |------|------|----------------|
-| `setup-mxmoe-env` | `.grok/workflows/setup-mxmoe-env.rhai` | Create/use conda env `mxmoe`, install smoke Python deps (skip flash by default), init submodules / hadamard, arch prep, L0–L2 ending in `run_mxmoe_gg` FP16 bench |
-| `install-flash-lmeval` | `.grok/workflows/install-flash-lmeval.rhai` | Compile-install `flash_attn` and install `lm_eval` into `mxmoe`, then verify FA2 + project `Evaluator` / lm_eval |
-| `reproduce-acc` | `.grok/workflows/reproduce-acc.rhai` | **Accuracy-only** multi-GPU path for any `ID2NAME` MoE: required `model_id`+`model_path`; pins `gpu_a/b/c` so **calib A‖B** (and baseline on `gpu_c`) run in parallel; then ILP + MxMoE eval; **no** kernel/`run_mxmoe_gg` |
-| `quant-lowbit-gptq-had` | `.grok/workflows/quant-lowbit-gptq-had.rhai` | **Quant-only** online GPTQ-Had for the 12 solved `ds2` / `qwen2_moe` qconfigs (BPV 2.25/3.25, R=0/0.5/1). One GPU per model, six configs sequential. No ILP, no calib, no PPL, no kernel |
+| `setup-mxmoe-env` | `.grok/workflows/setup-mxmoe-env.rhai` | Create/reuse unified `mxmoe`, install root requirements, build/reuse compatible extensions and source-editable vLLM, then L0–L2 ending in `run_mxmoe_gg` FP16 bench |
+| `install-flash-lmeval` | `.grok/workflows/install-flash-lmeval.rhai` | Install/reuse compatible FlashAttention and lm_eval within the same constrained stack, then verify FA2 + project `Evaluator` / lm_eval |
+| `reproduce-acc` | `.grok/workflows/reproduce-acc.rhai` | **Accuracy-only workload, shared environment**: required `model_id`+`model_path`; pins `gpu_a/b/c` for parallel calibration and baseline, then ILP + MxMoE eval; no kernel benchmark |
+| `quant-lowbit-gptq-had` | `.grok/workflows/quant-lowbit-gptq-had.rhai` | **Quant-only workload, shared environment**: GPTQ-Had for 12 solved `ds2` / `qwen2_moe` qconfigs (BPV 2.25/3.25, R=0/0.5/1); one GPU per model, six configs sequential; no ILP, calib, PPL, or kernel benchmark |
 
 (User-level workflows under `~/.grok/workflows/` are separate and not listed here.)
 
@@ -175,5 +182,5 @@ Artifacts (gitignored large dumps): under `MXMOE_EXPORT_HF_ROOT` / default RAID 
 ## Related conventions
 
 - Prefer minimal, necessary source diffs; keep generated kernels/build trees out of git (see `.gitignore`).
-- Prefer the isolated conda env **`mxmoe`** for MxMoE work; do not pollute unrelated envs unless the user asks.
+- Use the isolated Conda environment **`mxmoe`** for MxMoE work; all repository tests MUST follow the mandatory environment rule above.
 - Large export trees under `outputs/` / RAID export roots are gitignored; do not commit model weights.

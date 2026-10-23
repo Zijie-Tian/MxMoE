@@ -13,3 +13,7 @@
 [submodule "mxmoe/kernels/src/3rdparty/cutlass"]
 	path = mxmoe/kernels/src/3rdparty/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "3rdparty/vllm"]
+	path = 3rdparty/vllm
+	url = https://github.com/Zijie-Tian/vllm.git
+	branch = tzj/mxmoe

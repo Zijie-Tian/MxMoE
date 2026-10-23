@@ -98,7 +98,9 @@ class RMSN(torch.nn.Module):
         super().__init__()
         self.eps = eps
         self.mean_dim = mean_dim
-        self.weight = torch.nn.Parameter(torch.zeros(1))
+        # Fusion already absorbed the original scale. Keep a native-shaped unit
+        # weight so save/reload into stock RMSNorm is an identity multiply.
+        self.weight = torch.nn.Parameter(torch.ones(mean_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
@@ -106,16 +108,13 @@ class RMSN(torch.nn.Module):
             x = x.to(torch.float32)
         variance = x.pow(2).sum(-1, keepdim=True) / self.mean_dim
         x = x * torch.rsqrt(variance + self.eps)
-        return x.to(input_dtype)
+        return (x * self.weight.to(dtype=x.dtype, device=x.device)).to(input_dtype)
 
 
 class NewQwen2MoeRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
-        """
-        modified from Qwen2MoeRMSNorm, remove the weight parameter
-        """
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
@@ -123,7 +122,7 @@ class NewQwen2MoeRMSNorm(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return hidden_states.to(input_dtype)
+        return (hidden_states * self.weight.to(dtype=hidden_states.dtype, device=hidden_states.device)).to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"

@@ -1,5 +1,6 @@
-// reproduce-acc: Generic MxMoE paper accuracy pipeline (PPL + optional
-// zero-shot). Model is REQUIRED (model_id + model_path). NO kernel/run_mxmoe_gg.
+// reproduce-acc: Accuracy-only workload on the shared conda env mxmoe
+// (doc/environment.md, CUDA 13.0). Model is REQUIRED (model_id + model_path).
+// NO kernel/run_mxmoe_gg. Does not install packages or use another env.
 //
 // MULTI-GPU: pin each heavy job to ONE physical GPU (do not share
 // CUDA_VISIBLE_DEVICES across concurrent full-model loads). Default layout for
@@ -11,17 +12,18 @@
 //   - Parallel after solver: MxMoE eval @ gpu_a | optional uniform @ gpu_b
 //
 // Side effects: calib/, qconfigs/, data/cache/, GPU. Reports: scratch only.
+// Skip flags skip experiment stages only. They do not waive the shared env.
 //
 // Required args:
 //   model_id, model_path
 //
 // Optional args:
-//   env_name          default "mxmoe"
+//   env_name          default "mxmoe" (any other value is rejected)
 //   gpu_a             default "1"   (single-GPU pin for job A)
 //   gpu_b             default "2"
 //   gpu_c             default "3"   (empty string disables 3-way baseline||calib)
 //   gpu_devices       default "1,2,3"  (documentation / precheck visibility)
-//   cuda_home         default "/usr/local/cuda-12.4"
+//   cuda_home         default "" (resolve CUDA 13.0; never 12.4 or newest cuda*)
 //   nsamples          default "128"
 //   seqlen            default "4096"
 //   dataset           default "wiki2"
@@ -39,10 +41,10 @@
 //
 let meta = #{
     name: "reproduce-acc",
-    description: "Multi-GPU MoE accuracy reproduction: model_id/path args; parallel calib on separate GPUs; Baseline+MxMoE PPL/ZS (no kernel)",
-    when_to_use: "When you need Table-1 style PPL/zero-shot for any ID2NAME MoE model and should utilize multiple GPUs in parallel",
+    description: "Accuracy-only multi-GPU workload in conda env mxmoe on CUDA 13.0: model_id/path args; parallel calib; Baseline+MxMoE PPL/ZS (no kernel)",
+    when_to_use: "When you need Table-1 style PPL/zero-shot for any ID2NAME MoE model on the shared mxmoe stack and should use multiple GPUs in parallel",
     phases: [
-        #{ title: "Precheck", detail: "env, multi-GPU visible, flash_attn, lm_eval, model path" },
+        #{ title: "Precheck", detail: "mxmoe, CUDA 13.0, flash_attn, lm_eval, model path" },
         #{ title: "Model-Path", detail: ".env MXMOE_MODEL_<ID> = model_path" },
         #{ title: "Gate-Trace", detail: "real moe-gate on gpu_a" },
         #{ title: "Parallel-Calib", detail: "filter_a@gpu_a || filter_b@gpu_b (|| baseline@gpu_c)" },
@@ -93,7 +95,7 @@ let gpu_a = arg_str(args, "gpu_a", "1");
 let gpu_b = arg_str(args, "gpu_b", "2");
 let gpu_c = arg_str(args, "gpu_c", "3");
 let gpu_devices = arg_str(args, "gpu_devices", "1,2,3");
-let cuda_home = arg_str(args, "cuda_home", "/usr/local/cuda-12.4");
+let cuda_home = arg_str(args, "cuda_home", "");
 let nsamples = arg_str(args, "nsamples", "128");
 let seqlen = arg_str(args, "seqlen", "4096");
 let dataset = arg_str(args, "dataset", "wiki2");
@@ -112,7 +114,9 @@ let skip_calib = arg_bool(args, "skip_calib", false);
 let skip_solver = arg_bool(args, "skip_solver", false);
 let skip_baseline = arg_bool(args, "skip_baseline", false);
 let skip_mxmoe_eval = arg_bool(args, "skip_mxmoe_eval", false);
-
+if env_name != "mxmoe" {
+    pause("infra", "Refusing env_name='" + env_name + "'. Accuracy runs use conda env mxmoe only.");
+}
 // Whether to fan baseline into the calib parallel panel (needs a distinct gpu_c)
 let baseline_with_calib = !skip_baseline && gpu_c != "" && gpu_c != gpu_a && gpu_c != gpu_b;
 
@@ -124,7 +128,7 @@ let step_schema = #{
         "summary": #{ "type": "string" },
         "details": #{ "type": "string" },
         "artifact_path": #{ "type": "string" },
-        "log_tail": #{ "type": "string" },
+        "cuda_release": #{ "type": "string" },
     },
 };
 
@@ -144,11 +148,14 @@ let eval_schema = #{
 
 // Base env (no multi-GPU export — each job pins one id)
 let preamble = "";
-preamble += "Use isolated conda env `" + env_name + "` only.\n";
-preamble += "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate " + env_name + "\n";
-preamble += "export CUDA_HOME=" + cuda_home + "\n";
-preamble += "export PATH=$CUDA_HOME/bin:$PATH\n";
-preamble += "export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}\n";
+preamble += "REQUIRED environment: conda env mxmoe only. See doc/environment.md. Do not create, activate, or pip-install into another env.\n";
+preamble += "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate mxmoe\n";
+preamble += "Every python command is that interpreter (conda run --no-capture-output -n mxmoe python ...). Do not use bare pip.\n";
+preamble += "Resolve CUDA 13.0 before any GPU command. Supplied cuda_home arg: '" + cuda_home + "'.\n";
+preamble += "If that arg is non-empty, it is the only candidate and its nvcc must be 13.0. Refuse 12.4 and 13.1. Do not fall back.\n";
+preamble += "If it is empty, do not export an empty CUDA_HOME and do not keep an inherited 12.4 or 13.1 value.\n";
+preamble += "Use process CUDA_HOME only when its nvcc is 13.0; else /usr/local/cuda-13.0 when that nvcc is 13.0. Never pick the newest cuda directory.\n";
+preamble += "Then export PATH=$CUDA_HOME/bin:$PATH and LD_LIBRARY_PATH from $CUDA_HOME/lib64 (or lib if lib64 is absent).\n";
 preamble += "cd MxMoE repo root (git rev-parse --show-toplevel); export PYTHONPATH=$PWD:$PYTHONPATH\n";
 preamble += "CRITICAL multi-GPU rule: set CUDA_VISIBLE_DEVICES to EXACTLY ONE physical GPU id for this job.\n";
 preamble += "Do NOT export CUDA_VISIBLE_DEVICES=" + gpu_devices + " for concurrent full-model jobs.\n";
@@ -168,12 +175,12 @@ let pre_p = "";
 pre_p += "Precheck multi-GPU accuracy pipeline (PPL/ZS; no kernel).\n";
 pre_p += preamble;
 pre_p += "Pins: gpu_a=" + gpu_a + " gpu_b=" + gpu_b + " gpu_c=" + gpu_c + " list=" + gpu_devices + "\n";
-pre_p += "1) conda env " + env_name + "; torch cuda\n";
-pre_p += "2) flash_attn + is_flash_attn_2_available; lm_eval; Evaluator\n";
+pre_p += "1) mxmoe only. Python 3.12, torch 2.13.0+cu130, torch.version.cuda 13.0, nvcc release 13.0. Do not pip install. Set cuda_release to that nvcc release.\n";
+pre_p += "2) flash_attn 2.8.3.post2 and is_flash_attn_2_available; lm_eval 0.4.12; Evaluator; fast_hadamard_transform import. If missing, ok=false and point at doc/environment.md.\n";
 pre_p += "3) model_path exists with weights\n";
 pre_p += "4) nvidia-smi shows GPUs " + gpu_a + "," + gpu_b + "," + gpu_c + " free enough (~>30GB free each preferred)\n";
 pre_p += "5) gurobipy import OK\n";
-pre_p += "ok=true only if env+model+GPUs OK.\n";
+pre_p += "ok=true only if env+model+GPUs OK and cuda_release is 13.0.\n";
 
 let pre = agent(pre_p, #{
     label: "precheck",
@@ -185,6 +192,9 @@ if pre == () || !pre.success || pre.output == () {
 }
 if pre.output.ok != true {
     pause("infra", "Precheck not-ok: " + pre.output.summary + " | " + pre.output.details);
+}
+if pre.output.cuda_release != "13.0" {
+    pause("infra", "Precheck CUDA is not 13.0. Refusing 12.4, 13.1, or an unresolved toolkit.");
 }
 log("Precheck OK: " + pre.output.summary);
 
@@ -200,7 +210,7 @@ if skip_model_path {
     mp += "Configure the model checkpoint path via the gitignored .env (NEVER edit tracked project_config.py).\n";
     mp += "Repo-root .env: copy from .env.example if missing; set or update the single line " + env_key + "=" + model_path + " (idempotent, keep other keys).\n";
     mp += preamble;
-    mp += "Then run: python project_config.py --check " + model_id + " and verify tokenizer loads. ok=true only if the check exits 0.\n";
+    mp += "Then run: conda run --no-capture-output -n mxmoe python project_config.py --check " + model_id + " and verify tokenizer loads. ok=true only if the check exits 0.\n";
     let mpr = agent(mp, #{
         label: "model-path",
         capability_mode: "all",
