@@ -87,6 +87,50 @@ We explore the automated design of mixed-precision quantization scheme for MoE m
     python run_mxmoe_gg.py --model qwen2_moe --bs 8192 --layer 11 --qconfig <QCONFIG> --tile_config <TCONFIG>
     ```
 
+### Uniform GPTQ checkpoints for vLLM
+
+This is separate from the mixed-precision GroupGEMM benchmark above. The
+`compressed_tensors` export preserves the GPTQ codes, FP32 scales, and zero
+points in the layout consumed by vLLM/Humming. `hf_float` still stores floating
+weights and does not select a low-bit inference kernel.
+
+Use the shared CUDA 12.8 `mxmoe` environment from the environment guide. Model
+paths remain in `.env`; exported weights and measurement JSON stay under the
+gitignored output directories:
+
+```bash
+conda run --no-capture-output -n mxmoe python project_config.py --check ds2
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  python -m mxmoe.quant.export_gptq_hf --model ds2 --wbits 2 --groupsize 128 \
+  --device-map cpu --export-format compressed_tensors --pad-dense-ffn \
+  --save outputs/ds2-gptq-w2-g128-asym-ct-padffn
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  python run_vllm_gptq.py outputs/ds2-gptq-w2-g128-asym-ct-padffn \
+  --prompt-len 512 --batch-size 1 --output-tokens 128 --warmup 3 --repeats 5 \
+  --dtype half --trust-remote-code --output out/bench/ds2-w2a16-vllm.json
+```
+
+The TP=1 padding changes only the exported dense FFN width from 10944 to 11008;
+the original checkpoint and expert width remain unchanged. Added quantized
+weights encode zero as `q == zero_point`. This format requires static groups and
+does not support Hadamard rotation, activation order, or partial-layer exports.
+
+The runner uses a separate eager engine to observe real Humming calls, then an
+uninstrumented timing engine. It checks both dense MLP/shared-expert and routed
+expert W2A16 paths. Prefill, decode, TPOT, and TTFT are request-phase timings,
+not isolated CUDA kernel timings; JSON includes their exact boundaries. Prefix
+caching is disabled. Multi-request batches are enqueued behind a scheduler
+barrier so their prefill finishes together before decode. A successful export
+alone is not inference verification.
+
+For W2A4 on Ampere, reuse the same checkpoint and add `--activation-bits 4`
+with `--batch-size 1 --tensor-parallel-size 1`. Select one physical GPU per
+process with `CUDA_VISIBLE_DEVICES`; independent cases may run on separate
+GPUs. This mode enables dynamic per-token INT4 activations for the quantized
+MLPs, leaves attention in floating point, and forbids activation fallback.
+It uses one timing engine with a loaded-precision check, without the separate
+A16 observation pass. The checkpoint weights are not requantized or modified.
+
 ## 👀 Limitations
 
 ⚠️ MxMoE is mainly test on RTX-4090. The current implementation cannot fully utilize the performance of hopper and later GPU architectures.

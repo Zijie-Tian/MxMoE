@@ -250,4 +250,4 @@ conda run --no-capture-output -n mxmoe python project_config.py --check qwen2_mo
 - vLLM：需要显存充足的 GPU，实际加载模型并用 `LLM.generate` 覆盖 prefill 和多 token decode，检查返回 token；导入成功或单个 RMSNorm 通过不等同于此项通过。
 - Performance：固定 GPU、模型、dtype、输入/输出长度、batch、warm-up、计时范围后再测吞吐/延迟。MxMoE 的 `run_mxmoe_gg.py` 是独立 GroupGEMM benchmark，不等同于 vLLM 端到端测速。
 
-先前已完成真实 Qwen/DeepSeek 的短 GPTQ 导出及修正后 Qwen 的 HF 重载前向；**尚无 vLLM `LLM.generate` 或端到端性能验证结论**。环境统一不代表 MxMoE 混合精度 kernel 已接入 vLLM，更不代表复现了论文性能。
+`run_vllm_gptq.py` 对具体的 packed checkpoint 分别核验实际 Humming 调用和未插桩的 prefill/decode 性能；用法见根 README。测量 JSON 保留在 `out/bench/`，不将机器本地路径、安装日志或逐机实验报告写入本文。单个算子或环境检查通过不代表某个模型已通过推理验证，也不代表 MxMoE 自定义混合精度 kernel 已接入 vLLM。
