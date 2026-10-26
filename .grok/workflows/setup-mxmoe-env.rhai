@@ -8,8 +8,8 @@
 // Args (all optional):
 //   env_name       default "mxmoe" (any other value is rejected)
 //   python         default "3.12" (doc/environment.md create spec; 3.12.13 also accepted)
-//   cuda_home      default "" (this arg if it is CUDA 13.0, else discover a
-//                  13.0 toolkit; never inherited 12.4 or newest cuda*)
+//   cuda_home      default "" (this arg if it is CUDA 12.8, else discover a
+//                  12.8 toolkit; never inherited 12.4 or newest cuda*)
 //   batch_size     default 512  (L2 tokens)
 //   layer          default 11
 //   skip_flash     default true (reuse an already verified compatible
@@ -20,10 +20,10 @@
 
 let meta = #{
     name: "setup-mxmoe-env",
-    description: "Create or reuse conda env mxmoe on CUDA 13.0, install requirements.txt under constraints.txt, reuse or build Hadamard, FlashAttention, and source-editable vLLM, then pass L0/L1/L2 ending in run_mxmoe_gg FP16 bench",
+    description: "Create or reuse conda env mxmoe on CUDA 12.8, install requirements.txt under constraints.txt, reuse or build Hadamard, FlashAttention, and source-editable vLLM, then pass L0/L1/L2 ending in run_mxmoe_gg FP16 bench",
     when_to_use: "On a new machine or when the single mxmoe performance stack must be created or verified before kernel smoke or later experiments",
     phases: [
-        #{ title: "Inventory", detail: "GPU, CUDA 13.0, gcc-13, conda, disk, repo state (read-only)" },
+        #{ title: "Inventory", detail: "GPU, CUDA 12.8, gcc-13, conda, disk, repo state (read-only)" },
         #{ title: "Conda-Env", detail: "init submodules, then execute doc/environment.md section 3 Python install" },
         #{ title: "Repo-Prep", detail: "submodules, then the guide's Hadamard, FlashAttention, and editable vLLM steps" },
         #{ title: "Verify-L0-L1", detail: "guide section 5 import check and small CUDA numeric smoke" },
@@ -128,13 +128,13 @@ let l2_schema = #{
 };
 
 let cuda_rules = "";
-cuda_rules += "CUDA toolkit must be release 13.0. Never use 12.4, 13.1, a cu124 index, or whichever nvcc is first on PATH.\n";
+cuda_rules += "CUDA toolkit must be release 12.8. Never use 12.4, 13.1, a cu124 index, or whichever nvcc is first on PATH.\n";
 cuda_rules += "Resolve CUDA_HOME in this order, then run `$CUDA_HOME/bin/nvcc --version` and set cuda_release to that release:\n";
-cuda_rules += "1) If the supplied cuda_home argument is non-empty, use only that directory. If its nvcc is not 13.0, stop. Do not fall back.\n";
-cuda_rules += "2) Else if process CUDA_HOME is set, accept it only when its nvcc release is 13.0. Ignore 12.4 or 13.1.\n";
-cuda_rules += "3) Else use /usr/local/cuda-13.0 when that directory's nvcc release is 13.0.\n";
-cuda_rules += "4) Do not select the newest /usr/local/cuda* entry. Do not follow a bare /usr/local/cuda symlink unless `nvcc` there is 13.0.\n";
-cuda_rules += "If no 13.0 toolkit is found, ok=false. Export CUDA_HOME, PATH=$CUDA_HOME/bin:$PATH, and LD_LIBRARY_PATH from $CUDA_HOME/lib64 (or $CUDA_HOME/lib if lib64 is absent).\n";
+cuda_rules += "1) If the supplied cuda_home argument is non-empty, use only that directory. If its nvcc is not 12.8, stop. Do not fall back.\n";
+cuda_rules += "2) Else if process CUDA_HOME is set, accept it only when its nvcc release is 12.8. Ignore 12.4 or 13.1.\n";
+cuda_rules += "3) Else use /usr/local/cuda-12.8 when that directory's nvcc release is 12.8.\n";
+cuda_rules += "4) Do not select the newest /usr/local/cuda* entry. Do not follow a bare /usr/local/cuda symlink unless `nvcc` there is 12.8.\n";
+cuda_rules += "If no 12.8 toolkit is found, ok=false. Export CUDA_HOME, PATH=$CUDA_HOME/bin:$PATH, and LD_LIBRARY_PATH from $CUDA_HOME/lib64 (or $CUDA_HOME/lib if lib64 is absent).\n";
 
 // =============================================================================
 phase("Inventory");
@@ -149,16 +149,16 @@ inv_prompt += "1) pwd; git rev-parse --show-toplevel; git branch --show-current\
 inv_prompt += "2) nvidia-smi (note GPU name, driver, CUDA version)\n";
 inv_prompt += "3) Detect compute capability (e.g. deviceQuery or python with pynvml/torch if available; else map RTX 3090→86, 4090→89, A100→80)\n";
 inv_prompt += "4) which conda; conda --version; conda env list. Note whether env mxmoe exists and, if so, its python version. Do not activate a different env as a substitute.\n";
-inv_prompt += "5) Resolve CUDA 13.0. Supplied cuda_home argument: '" + cuda_home + "'\n";
+inv_prompt += "5) Resolve CUDA 12.8. Supplied cuda_home argument: '" + cuda_home + "'\n";
 inv_prompt += cuda_rules;
-inv_prompt += "6) command -v gcc-13; command -v g++-13; gcc-13 --version | head -1. Both are required for compiled extensions.\n";
+inv_prompt += "6) Resolve a paired GCC/G++ 13: prefer gcc-13/g++-13 on PATH, otherwise use x86_64-conda-linux-gnu-gcc/g++ in the mxmoe env's bin directory. Record absolute paths and actual versions in notes.\n";
 inv_prompt += "7) cmake --version; ninja --version (record; the env's copies are checked after install)\n";
 inv_prompt += "8) df -h . | tail -1 (disk free)\n";
 inv_prompt += "9) git submodule status | head -20; test whether mxmoe/3rdparty/fast-hadamard-transform has files beyond an empty dir\n";
 inv_prompt += "10) test -f requirements.txt; test -f constraints.txt; test -f doc/environment.md; test -f 3rdparty/vllm/rust-toolchain.toml; ls perf/performance_table.json; test -f project_config.py\n";
 inv_prompt += "11) If rustc is installed, record `rustc --version`. Expected channel is 1.95 from 3rdparty/vllm/rust-toolchain.toml. Do not install Rust in this phase.\n\n";
-inv_prompt += "Set cuda_release to the nvcc release string, exactly 13.0 when accepted.\n";
-inv_prompt += "Set ok=false if no GPU, no conda, disk free < 20GB, gcc-13 or g++-13 is missing, or no CUDA 13.0 toolkit was resolved.\n";
+inv_prompt += "Set cuda_release to the nvcc release string, exactly 12.8 when accepted.\n";
+inv_prompt += "Set ok=false if no GPU, no conda, disk free < 20GB, no GCC/G++ 13 pair can be resolved, or no CUDA 12.8 toolkit was resolved.\n";
 inv_prompt += "Put blockers/warnings in notes. Do not treat a 12.4 toolkit as acceptable.\n";
 
 let inv = agent(inv_prompt, #{
@@ -176,8 +176,8 @@ if inv.output.ok != true {
     pause("infra", msg);
 }
 
-if inv.output.cuda_release != "13.0" {
-    pause("infra", "CUDA toolkit must be 13.0 (refusing 12.4 and non-13.0 auto-detect). Inventory cuda_home=" + inv.output.cuda_home);
+if inv.output.cuda_release != "12.8" {
+    pause("infra", "CUDA toolkit must be 12.8 (refusing 12.4 and non-12.8 auto-detect). Inventory cuda_home=" + inv.output.cuda_home);
 }
 
 log("Inventory OK: GPU=" + inv.output.gpu_name + " cc=" + inv.output.compute_capability + " cuda_home=" + inv.output.cuda_home);
@@ -201,7 +201,7 @@ if dry_run {
     dry_report += "Would proceed to conda create/reuse + compiled extensions + L0/L1/L2 if dry_run=false.\n";
     let p = write_scratch_file("setup-mxmoe-env-dry-run.md", dry_report);
     complete(#{
-        summary: "dry_run only: inventory passed for mxmoe on CUDA 13.0; no install performed",
+        summary: "dry_run only: inventory passed for mxmoe on CUDA 12.8; no install performed",
         dry_run: true,
         env_name: "mxmoe",
         cuda_home: inv.output.cuda_home,
@@ -218,11 +218,11 @@ let conda_prompt = "";
 conda_prompt += "Create or reuse conda env mxmoe and install Python dependencies by executing doc/environment.md. Do not edit that file.\n";
 conda_prompt += "Do not invent a second pip line, index URL, or requirements file. If the guide and this prompt disagree, follow the guide on commands and stop if that would install torch 2.6 or CUDA 12.4.\n";
 conda_prompt += "Repo root: " + inv.output.repo_root + "\n";
-conda_prompt += "CUDA_HOME already resolved: " + inv.output.cuda_home + " (nvcc must stay 13.0).\n";
+conda_prompt += "CUDA_HOME already resolved: " + inv.output.cuda_home + " (nvcc must stay 12.8).\n";
 conda_prompt += "force_recreate: " + force_recreate.to_string() + "\n";
 conda_prompt += "skip_flash does not apply here and must not drop a dependency.\n\n";
 conda_prompt += "Steps:\n";
-conda_prompt += "1) Read doc/environment.md sections 2 and 3. Apply section 2 exports in this shell, using the resolved CUDA 13.0 toolkit as CUDA_HOME.\n";
+conda_prompt += "1) Read doc/environment.md sections 2 and 3. Apply section 2 exports in this shell, using the resolved CUDA 12.8 toolkit as CUDA_HOME.\n";
 conda_prompt += "2) MXMOE_BUILD_ROOT must already be set. Do not invent a machine-local path or a RAID default. If it is unset, ok=false.\n";
 conda_prompt += "3) If force_recreate and env mxmoe exists: conda env remove -n mxmoe -y. Otherwise do not delete it.\n";
 conda_prompt += "4) If env mxmoe is missing, run the guide's create command: conda create -n mxmoe python=3.12 -y\n";
@@ -239,7 +239,7 @@ conda_prompt += "   pycuda may compile as part of that file. That is still this 
 conda_prompt += "   Retry once on a transient network error. If installed distributions already satisfy constraints.txt and the guide's version table, do not reinstall them.\n";
 conda_prompt += "10) This phase stops before the guide's Hadamard, FlashAttention, and vLLM blocks. Do not compile those here.\n";
 conda_prompt += "11) Do not set VLLM_USE_PRECOMPILED or any VLLM_USE_PRECOMPILED* variable. Do not download HF models.\n";
-conda_prompt += "12) Run the guide's section 3 version print. Require torch 2.13.0+cu130, torch.version.cuda 13.0, transformers 5.19.0. Reject torch 2.6 and transformers 4.x.\n";
+conda_prompt += "12) Run the guide's section 3 version print. Require torch 2.11.0+cu128, torch.version.cuda 12.8, transformers 5.19.0. Reject torch 2.6 and transformers 4.x.\n";
 conda_prompt += "Return ok=true only if that print matches and torch.cuda.is_available() is True inside mxmoe.\n";
 conda_prompt += "Put the env prefix in env_path. Include the last 40 lines of install log in log_tail if long.\n";
 
@@ -268,9 +268,9 @@ prep_prompt += "Prepare the MxMoE repo and compiled extensions on THIS node. Rep
 prep_prompt += "Use conda env mxmoe only. source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate mxmoe\n";
 prep_prompt += "Every pip command is `python -m pip` from that interpreter. Do not use bare pip, base, or another env.\n";
 prep_prompt += "Detected compute capability for tile tables: " + inv.output.compute_capability + "\n";
-prep_prompt += "CUDA_HOME: " + inv.output.cuda_home + " (must remain 13.0)\n";
+prep_prompt += "CUDA_HOME: " + inv.output.cuda_home + " (must remain 12.8)\n";
 prep_prompt += "skip_flash: " + skip_flash.to_string() + " — this may skip a FlashAttention rebuild only when the checks below already pass. It must not skip the package.\n";
-prep_prompt += "Host compiler for every native build: CC=$(command -v gcc-13), CXX=$(command -v g++-13). Do not fall back to another gcc.\n";
+prep_prompt += "Host compiler for every native build: resolve CC/CXX as the GCC/G++ 13 pair from inventory (system gcc-13/g++-13 or the mxmoe Conda compiler pair). Do not fall back to another version.\n";
 prep_prompt += "Do not reinstall a package that is already verified compatible with this torch and this GPU.\n";
 prep_prompt += "Do not download HF models. Do not edit doc/environment.md or write under docs/.\n\n";
 prep_prompt += cuda_rules;
@@ -281,7 +281,7 @@ prep_prompt += "Confirm 3rdparty/vllm/requirements/{cuda.txt,build/cuda.txt} exi
 prep_prompt += "### B) Compiled extensions — execute doc/environment.md, do not restate it\n";
 prep_prompt += "Read sections 3 and 4 and run those blocks. Do not copy source-cache pins, the FA3 patch, or MXMOE_BUILD_ROOT paths into another recipe.\n";
 prep_prompt += "If MXMOE_BUILD_ROOT is unset, stop. Do not invent a directory.\n";
-prep_prompt += "Apply the guide's section 2 exports first (CUDA 13.0, gcc-13, the guide's MAX_JOBS / NVCC_THREADS, unset VLLM_USE_PRECOMPILED*).\n";
+prep_prompt += "Apply the guide's section 2 exports first (CUDA 12.8, GCC/G++ 13, the guide's MAX_JOBS / NVCC_THREADS, unset VLLM_USE_PRECOMPILED*).\n";
 prep_prompt += "Reuse a Hadamard or standalone flash-attn build only when the guide's same-version numeric smoke already passes against this torch and this GPU. Otherwise run the guide's install block, even if skip_flash is true.\n";
 prep_prompt += "skip_flash never skips vLLM's vllm_flash_attn and never waives either package.\n";
 prep_prompt += "Do not reset local submodule fixes. The Hadamard CUDA 13 sm_70 guard described in the guide must stay.\n";
@@ -332,7 +332,7 @@ phase("Verify-L0-L1");
 let v01_prompt = "";
 v01_prompt += "Run L0 and L1 by executing doc/environment.md section 5. Do not rewrite its scripts or tolerances.\n";
 v01_prompt += "Repo: " + inv.output.repo_root + "\n";
-v01_prompt += "CUDA_HOME: " + inv.output.cuda_home + " (nvcc release must be 13.0, not 12.4 or 13.1).\n";
+v01_prompt += "CUDA_HOME: " + inv.output.cuda_home + " (nvcc release must be 12.8, not 12.4 or 13.1).\n";
 v01_prompt += "skip_flash=" + skip_flash.to_string() + " does not waive FlashAttention, Hadamard, or vLLM.\n";
 v01_prompt += "Use conda run --no-capture-output -n mxmoe. Do not use another env.\n\n";
 v01_prompt += "### L0 — guide import check, plus project imports\n";
@@ -373,9 +373,9 @@ l2_prompt += "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda ac
 l2_prompt += "The python on PATH must be the mxmoe interpreter. Do not use another env.\n";
 l2_prompt += "export CUDA_HOME=" + inv.output.cuda_home + "\n";
 l2_prompt += "export PATH=$CUDA_HOME/bin:$PATH\n";
-l2_prompt += "export CC=$(command -v gcc-13) CXX=$(command -v g++-13)\n";
+l2_prompt += "Resolve the GCC/G++ 13 pair from Inventory again and export its absolute paths as CC/CXX (system or mxmoe Conda pair).\n";
 l2_prompt += "Use this env's cmake and ninja. Do not apt-install a second toolchain. The verified env has cmake 4.4.4 and ninja 1.11.1.4; do not fail solely on a newer build that still drives this Ninja build.\n";
-l2_prompt += "Confirm nvcc is 13.0 before building.\n\n";
+l2_prompt += "Confirm nvcc is 12.8 before building.\n\n";
 l2_prompt += "### Final command (must run from repo root)\n";
 l2_prompt += "python run_mxmoe_gg.py --model qwen2_moe --dataset wiki2 --bs " + batch_size.to_string() + " --layer " + layer.to_string() + "\n";
 l2_prompt += "Equivalent explicit form: conda run --no-capture-output -n mxmoe python run_mxmoe_gg.py --model qwen2_moe --dataset wiki2 --bs " + batch_size.to_string() + " --layer " + layer.to_string() + "\n";
@@ -429,7 +429,7 @@ report_prompt += "L2 summary: " + l2.output.summary + "\n";
 report_prompt += "L2 bench_path: " + l2.output.bench_path + "\n";
 report_prompt += "skip_flash: " + skip_flash.to_string() + " (reuse only; FlashAttention was still required)\n\n";
 report_prompt += "Report MUST include sections:\n";
-report_prompt += "1. Environment (mxmoe, Python 3.12, torch 2.13.0+cu130, CUDA 13.0, doc/environment.md)\n";
+report_prompt += "1. Environment (mxmoe, Python 3.12, torch 2.11.0+cu128, CUDA 12.8, doc/environment.md)\n";
 report_prompt += "2. Compiled extensions as verified by the guide's import check and CUDA_NUMERIC_PASS — not an LLM.generate pass\n";
 report_prompt += "3. Patches applied (CMake arch, tile_config alias, synthetic trace path)\n";
 report_prompt += "4. Verification results (L0/L1/L2)\n";
@@ -463,13 +463,13 @@ scratch += "- report: " + report_path + "\n";
 let sp = write_scratch_file("setup-mxmoe-env-result.md", scratch);
 
 complete(#{
-    summary: "conda env mxmoe ready on CUDA 13.0; L0/L1/L2 passed",
+    summary: "conda env mxmoe ready on CUDA 12.8; L0/L1/L2 passed",
     env_name: "mxmoe",
     cuda_home: inv.output.cuda_home,
     gpu: inv.output.gpu_name,
     compute_capability: inv.output.compute_capability,
     final_test_target: final_cmd,
-    final_test_meaning: "FP16 GroupGEMM path: synthetic/real gate trace → template kernel codegen → CMake/NVCC build → ./build/test bench. Proves Python deps, CUDA 13.0 toolchain, submodules, and arch patches without downloading MoE weights.",
+    final_test_meaning: "FP16 GroupGEMM path: synthetic/real gate trace → template kernel codegen → CMake/NVCC build → ./build/test bench. Proves Python deps, CUDA 12.8 toolchain, submodules, and arch patches without downloading MoE weights.",
     bench_path: l2.output.bench_path,
     report_path: report_path,
     scratch: sp,

@@ -1,23 +1,20 @@
-# Core performance pins for the mxmoe conda env (Python 3.12).
+# Core performance pins for the mxmoe conda env (Python 3.12, CUDA 12.8).
 # requirements.txt applies this file. Do not relax these pins.
 #
-# Versions were read from installed mxmoe distributions (importlib.metadata)
-# and match the proven cu130 upgrade pin set, plus triton (verified 3.7.1).
-# Constraints do not install packages by themselves.
-#
-# In this env's packaging, 2.13.0+cu130 satisfies ==2.13.0 and sorts above
-# 2.13.0. The local-version pins stop a default-index Torch wheel.
+# CUDA 12.8 keeps the RTX 3090 deployment compatible with its existing driver.
+# PyTorch 2.11 is the newest published cu128 release and meets local vLLM's
+# stable-libtorch ABI floor. Local-version pins prevent a CUDA 13 wheel cutover.
 
-torch==2.13.0+cu130
-torchvision==0.28.0+cu130
-torchaudio==2.11.0+cu130
-torchcodec==0.14.0+cu130
-triton==3.7.1
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
+torchcodec==0.11.1+cu128
+triton==3.6.0
 transformers==5.19.0
 huggingface-hub==1.31.0
 accelerate==1.13.0
 numpy==2.2.6
-cuda-bindings==13.0.3
-cuda-python==13.0.3
-nvidia-nvjitlink==13.0.88
+cuda-bindings==12.9.4
+cuda-python==12.9.4
+nvidia-nvjitlink-cu12==12.8.93
 openai==2.44.0

@@ -3,7 +3,7 @@
 #   conda run --no-capture-output -n mxmoe python -m pip install -r requirements.txt
 #
 # Not installed here (compiled / source steps; see doc/environment.md):
-#   - flash-attn (verified 2.8.3.post2, sm80). Not a requirement line.
+#   - flash-attn (2.8.3.post2, built for the target GPU). Not a requirement line.
 #   - fast-hadamard-transform, from mxmoe/3rdparty/fast-hadamard-transform
 #     (verified 1.0.4.post1).
 #   - vLLM itself. Never a precompiled wheel. Follow doc/environment.md.
@@ -11,18 +11,18 @@
 #     (3rdparty/vllm/vllm/envs.py). Rust channel is
 #     3rdparty/vllm/rust-toolchain.toml (1.95), not a pip pin.
 #
-# Do not add NVIDIA CUDA 12 package pins. The smoke requirements file is gone.
+# CUDA 12.8 is shared by calibration, quantization, and inference.
 
---extra-index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://download.pytorch.org/whl/cu128
 -c constraints.txt
 
-# Reuse vLLM's runtime and build requirements; constraints select exact cu130
+# Reuse vLLM's runtime and build requirements; constraints select exact cu128
 # wheels where upstream version pins omit the local CUDA suffix.
 -r 3rdparty/vllm/requirements/cuda.txt
 -r 3rdparty/vllm/requirements/build/cuda.txt
 
-# Verified with torch 2.13.0+cu130. Not declared by the vLLM requirements files.
-triton==3.7.1
+# Match the Triton dependency of torch 2.11.0+cu128.
+triton==3.6.0
 
 # MxMoE direct imports not already required above.
 # accelerate is also pinned in constraints.txt (verified 1.13.0).

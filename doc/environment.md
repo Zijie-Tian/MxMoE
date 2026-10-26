@@ -9,17 +9,18 @@ Python 依赖入口是根目录 [`requirements.txt`](../requirements.txt)，关�
 | 组件 | 统一基线 |
 |---|---|
 | Python | 3.12 |
-| Torch / torchvision / torchaudio | 2.13.0+cu130 / 0.28.0+cu130 / 2.11.0+cu130 |
+| Torch / torchvision / torchaudio | 2.11.0+cu128 / 0.26.0+cu128 / 2.11.0+cu128 |
 | Transformers / Accelerate | 5.19.0 / 1.13.0 |
-| CUDA Toolkit / host compiler | CUDA 13.0 / GCC、G++ 13 |
+| CUDA Toolkit / host compiler | CUDA 12.8 / GCC、G++ 13 |
 | FlashAttention | 2.8.3.post2，使用当前 Torch 从源码编译 |
 | fast-hadamard-transform | 仓库子模块，从源码编译 |
 | vLLM | `3rdparty/vllm`，v0.32.0 基线上的本地 editable 源码构建 |
 | Rust | 以 vLLM 的 `rust-toolchain.toml` 为准，当前 1.95 |
+| Triton / Humming | 3.6.0 / 0.1.17（CUDA 12 依赖） |
 
 安装顺序：Conda 与工具链 → Python 依赖 → Hadamard、FlashAttention → vLLM 源码依赖 → editable vLLM → 验证。修改 Torch/CUDA 后必须重编原生扩展，不能复用旧 ABI 的 `.so`。
 
-当前构建基线是 Linux x86_64 + A100（SM80）。其他 GPU 仍使用同一套环境，但必须重新选择目标架构、重编扩展并验证；不能把 SM80 构建直接认作其他架构已支持。开发树的版本可能显示为 `0.32.1.dev0+g...`，不表示改用了另一个上游 release。
+当前部署目标是 Linux x86_64 + RTX 3090（SM86），使用现有驱动可支持的 CUDA 12.8。Torch 2.11 是已发布 cu128 wheel 的最高版本，也满足本地 vLLM stable-libtorch 扩展的最低 ABI 版本；依赖声明已同步到该版本。其他 GPU 仍使用同一环境，但必须重新选择目标架构、重编扩展并验证。开发树使用动态生成的 dev 版本；复现时同时记录 `vllm.__version__` 和源码 commit，不把它当作同名 stable 发行版。
 
 ## 2. Conda、工具链和机器本地目录
 
@@ -38,10 +39,10 @@ export MXMOE_REPO="$PWD"
 git submodule update --init --recursive
 ```
 
-先在当前 shell 设置 `CUDA_HOME` 为本机 **CUDA 13.0 toolkit** 目录，`MXMOE_BUILD_ROOT` 为有足够空间的持久构建目录（优先大容量数据盘）。这两个绝对路径不提交到仓库。已有本地子模块修改不可用 `--force` 或 reset 覆盖，尤其是下面列出的编译兼容修正。
+先在当前 shell 设置 `CUDA_HOME` 为本机 **CUDA 12.8 toolkit** 目录，`MXMOE_BUILD_ROOT` 为有足够空间的持久构建目录。这两个绝对路径不提交到仓库。已有本地子模块修改不可用 `--force` 或 reset 覆盖。若系统没有 GCC/G++ 13，可在同一环境安装 `gcc_linux-64=13 gxx_linux-64=13`，并将下方 `CC`、`CXX` 指向该环境的编译器。
 
 ```bash
-: "${CUDA_HOME:?请设置 CUDA 13.0 toolkit 路径}"
+: "${CUDA_HOME:?请设置 CUDA 12.8 toolkit 路径}"
 : "${MXMOE_BUILD_ROOT:?请设置持久构建目录}"
 export PATH="$CUDA_HOME/bin:$PATH"
 export CC=gcc-13 CXX=g++-13
@@ -54,14 +55,14 @@ export CARGO_TARGET_DIR="$MXMOE_BUILD_ROOT/cargo-target"
 mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$FETCHCONTENT_BASE_DIR" "$CARGO_HOME"
 export PATH="$CARGO_HOME/bin:$PATH"
 export MAX_JOBS=2 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release
-export TORCH_CUDA_ARCH_LIST=8.0 FLASH_ATTN_CUDA_ARCHS=80
+export TORCH_CUDA_ARCH_LIST=8.6 FLASH_ATTN_CUDA_ARCHS=86
 unset VLLM_USE_PRECOMPILED VLLM_PRECOMPILED_WHEEL_LOCATION VLLM_USE_PRECOMPILED_RUST
 nvcc --version
 "$CC" --version
 conda run --no-capture-output -n mxmoe python -c 'import sys; print(sys.executable)'
 ```
 
-`nvcc` 必须是 13.0；不要盲从可能指向 13.1 的 `cuda` 符号链接。`nvidia-smi` 中的 CUDA 版本是驱动支持上限，不是 toolkit 版本。需要支持 CUDA 13.0 的驱动，以及已安装的 [rustup](https://rustup.rs/)；安装指定 Rust 工具链：
+`nvcc` 必须是 12.8；不要盲从可能指向其他版本的 `cuda` 符号链接。`nvidia-smi` 中的 CUDA 版本是驱动支持上限，不是 toolkit 版本。需要支持 CUDA 12.8 的驱动，以及已安装的 [rustup](https://rustup.rs/)；安装指定 Rust 工具链：
 
 ```bash
 rustup toolchain install 1.95 --profile minimal
@@ -78,23 +79,12 @@ conda run --no-capture-output -n mxmoe python -m pip install -r requirements.txt
 conda run --no-capture-output -n mxmoe python -c 'import torch, transformers; print(torch.__version__, torch.version.cuda, transformers.__version__)'
 ```
 
-确认输出对应 Torch `2.13.0+cu130`、CUDA `13.0`、Transformers `5.19.0`。`requirements.txt` 不负责构建下列扩展；它们必须使用上一步已经安装的 Torch，因此禁用 build isolation。已有同版本且数值 smoke 通过的构建可复用；Torch/CUDA 变化后才使用 `--force-reinstall` 重建。
+确认输出对应 Torch `2.11.0+cu128`、CUDA `12.8`、Transformers `5.19.0`。`requirements.txt` 不负责构建下列扩展；它们必须使用上一步已经安装的 Torch，因此禁用 build isolation。已有同版本且数值 smoke 通过的构建可复用；Torch/CUDA 变化后才使用 `--force-reinstall` 重建。
 
 重编 FlashAttention 时必须保留 `--no-cache-dir`：`--no-binary`、`--force-reinstall` 和 `FLASH_ATTENTION_FORCE_BUILD=TRUE` 本身不能阻止 pip 复用此前从 sdist 构建的 wheel。否则更换 Torch/CUDA 后仍可能装回旧 ABI 的扩展。
 
-先应用主仓库版本化的 [Hadamard CUDA 13 补丁](../patches/fast-hadamard-cuda13.patch)。它针对当前子模块版本，已应用时直接复用；无需向上游 Hadamard 仓库推送本地提交：
+CUDA 12.8 无需额外应用 CUDA 13 的 Hadamard 编译补丁；已有子模块中的兼容修正保留。以下两个扩展均使用同一 `mxmoe` 的 Python 源码构建：
 
-```bash
-if git -C mxmoe/3rdparty/fast-hadamard-transform apply --reverse --check \
-  "$MXMOE_REPO/patches/fast-hadamard-cuda13.patch" 2>/dev/null; then
-  printf 'Hadamard CUDA 13 patch already applied\n'
-else
-  git -C mxmoe/3rdparty/fast-hadamard-transform apply --check \
-    "$MXMOE_REPO/patches/fast-hadamard-cuda13.patch" &&
-  git -C mxmoe/3rdparty/fast-hadamard-transform apply \
-    "$MXMOE_REPO/patches/fast-hadamard-cuda13.patch"
-fi
-```
 
 ```bash
 FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE \
@@ -107,11 +97,11 @@ conda run --no-capture-output -n mxmoe python -m pip install \
   -c constraints.txt flash-attn==2.8.3.post2
 ```
 
-Hadamard 子模块的 `setup.py` 必须保留 CUDA 13 下不生成 `compute_70/sm_70` 的条件分支，否则 NVCC 会拒绝编译。独立 `flash_attn` 和 vLLM 内置的 `vllm_flash_attn` 是两套扩展：其中一套成功不代表另一套已构建。
+独立 `flash_attn` 和 vLLM 内置的 `vllm_flash_attn` 是两套扩展：其中一套成功不代表另一套已构建。
 
 ## 4. 准备 vLLM 源码依赖并安装
 
-使用仓库记录的 vLLM 子模块版本，不临时切到 upstream 最新分支。不要运行 `tools/use_existing_torch.py` 去改写依赖，也不要设置 `VLLM_USE_PRECOMPILED=1`；当前 Torch 已满足源码要求。
+使用仓库记录的 vLLM 子模块版本，不临时切到 upstream 最新分支。CUDA 12.8 的 Torch 版本在根约束与子模块依赖中统一固定为 2.11；不要用 `tools/use_existing_torch.py` 删除版本约束，也不要设置 `VLLM_USE_PRECOMPILED=1`。所有原生扩展均从当前源码构建。
 
 ### 源码缓存
 
@@ -155,7 +145,7 @@ export FMHA_SM100_SRC_DIR="$MXMOE_BUILD_ROOT/src/MSA"
 export TML_FA4_SRC_DIR="$MXMOE_BUILD_ROOT/src/tml-fa4"
 ```
 
-### A100 的 FA3 构建边界
+### Ampere 的 FA3 构建边界
 
 本地 vLLM `setup.py` 已在 `TORCH_CUDA_ARCH_LIST` 不含 9.x 时跳过请求 Hopper FA3。当前外部 flash-attention 固定版本还需保留以下 CMake 修正：空 `FA3_ARCHS` 时不定义 GPU FA3 扩展，仅保留空目标。对**新下载、尚未修正**的源码缓存应用一次；已有修正的缓存不要重复应用。
 
@@ -206,8 +196,8 @@ import vllm._C_stable_libtorch
 import vllm._moe_C_stable_libtorch
 import vllm.vllm_flash_attn._vllm_fa2_C
 from mxmoe.quant.evaluator import Evaluator
-assert torch.__version__ == '2.13.0+cu130'
-assert torch.version.cuda == '13.0'
+assert torch.__version__ == '2.11.0+cu128'
+assert torch.version.cuda == '12.8'
 assert transformers.__version__ == '5.19.0'
 assert accelerate.__version__ == '1.13.0'
 assert flash_attn.__version__ == '2.8.3.post2'

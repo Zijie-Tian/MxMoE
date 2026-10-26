@@ -2,15 +2,15 @@
 // conda env mxmoe, and confirm lm_eval from the shared requirements pin.
 // Does not create another env, reinstall torch, or install precompiled vLLM.
 // FlashAttention executes doc/environment.md section 3. lm_eval==0.4.12 is not
-// a second pip spec. CUDA toolkit is 13.0.
+// a second pip spec. CUDA toolkit is 12.8.
 //
 // Skip flags reuse an already verified compatible package. They do not omit a
 // mandatory dependency and cannot make Verify pass while a package is missing.
 //
 // Args (all optional):
 //   env_name          default "mxmoe" (any other value is rejected)
-//   cuda_home         default "" (this arg if it is CUDA 13.0, else discover
-//                     a 13.0 toolkit; never /usr/local/cuda-12.4 or newest cuda*)
+//   cuda_home         default "" (this arg if it is CUDA 12.8, else discover
+//                     a 12.8 toolkit; never /usr/local/cuda-12.4 or newest cuda*)
 //   flash_version     default "2.8.3.post2" (any other value is rejected)
 //   lm_eval_spec      default "lm_eval==0.4.12" (any other value is rejected)
 //   max_jobs          default "2" (matches doc/environment.md section 2)
@@ -24,10 +24,10 @@
 
 let meta = #{
     name: "install-flash-lmeval",
-    description: "Reuse or compile-install flash-attn 2.8.3.post2 and confirm lm_eval 0.4.12 in conda env mxmoe on CUDA 13.0, then verify FA2 and the project Evaluator",
+    description: "Reuse or compile-install flash-attn 2.8.3.post2 and confirm lm_eval 0.4.12 in conda env mxmoe on CUDA 12.8, then verify FA2 and the project Evaluator",
     when_to_use: "When flash_attention_2 and lm_eval must be present in the existing mxmoe performance stack",
     phases: [
-        #{ title: "Precheck", detail: "mxmoe env, CUDA 13.0, existing torch cu130, disk" },
+        #{ title: "Precheck", detail: "mxmoe env, CUDA 12.8, existing torch cu128, disk" },
         #{ title: "Install-lm_eval", detail: "reuse lm_eval==0.4.12 from requirements.txt; do not install another spec" },
         #{ title: "Install-flash_attn", detail: "reuse or execute the guide's section 3 flash-attn block" },
         #{ title: "Verify", detail: "guide numeric smoke plus lm_eval, Evaluator, and the transformers FA2 flag" },
@@ -108,12 +108,12 @@ let verify_schema = #{
 };
 
 let cuda_rules = "";
-cuda_rules += "CUDA toolkit must be release 13.0. Never use 12.4, 13.1, or whichever nvcc is first on PATH.\n";
+cuda_rules += "CUDA toolkit must be release 12.8. Never use 12.4, 13.1, or whichever nvcc is first on PATH.\n";
 cuda_rules += "Supplied cuda_home argument: '" + cuda_home + "'.\n";
-cuda_rules += "If that argument is non-empty, use only that directory and require nvcc release 13.0. Do not fall back.\n";
+cuda_rules += "If that argument is non-empty, use only that directory and require nvcc release 12.8. Do not fall back.\n";
 cuda_rules += "If it is empty, do not export an empty CUDA_HOME and do not keep an inherited 12.4 or 13.1 CUDA_HOME.\n";
-cuda_rules += "Accept process CUDA_HOME only when its nvcc is 13.0; otherwise use /usr/local/cuda-13.0 when that nvcc is 13.0.\n";
-cuda_rules += "Do not select the newest /usr/local/cuda* entry. Do not follow a bare /usr/local/cuda symlink unless nvcc is 13.0.\n";
+cuda_rules += "Accept process CUDA_HOME only when its nvcc is 12.8; otherwise use /usr/local/cuda-12.8 when that nvcc is 12.8.\n";
+cuda_rules += "Do not select the newest /usr/local/cuda* entry. Do not follow a bare /usr/local/cuda symlink unless nvcc is 12.8.\n";
 cuda_rules += "Export CUDA_HOME, PATH=$CUDA_HOME/bin:$PATH, and LD_LIBRARY_PATH from $CUDA_HOME/lib64 (or lib if lib64 is absent).\n";
 
 // =============================================================================
@@ -134,13 +134,13 @@ pre_prompt += "\nExecute (shell, do not guess):\n";
 pre_prompt += "1) source \"$(conda info --base)/etc/profile.d/conda.sh\"; conda env list | grep mxmoe\n";
 pre_prompt += "2) ENV_PY=$(conda run --no-capture-output -n mxmoe which python)\n";
 pre_prompt += "3) conda run --no-capture-output -n mxmoe python -c \"import sys,torch; print(sys.prefix); print(sys.version); print(torch.__version__, torch.version.cuda, torch.cuda.is_available())\"\n";
-pre_prompt += "4) Resolve CUDA 13.0 as above; `$CUDA_HOME/bin/nvcc --version`\n";
+pre_prompt += "4) Resolve CUDA 12.8 as above; `$CUDA_HOME/bin/nvcc --version`\n";
 pre_prompt += "5) df -h . | tail -1\n";
 pre_prompt += "6) pwd; git rev-parse --show-toplevel 2>/dev/null || true; test -f doc/environment.md; test -f constraints.txt\n";
 pre_prompt += "7) conda run --no-capture-output -n mxmoe python -c \"import flash_attn,lm_eval; print(flash_attn.__version__, lm_eval.__version__)\" (report missing imports; do not install)\n\n";
-pre_prompt += "ok=true only if env mxmoe exists, Python is 3.12 (current interpreter 3.12.13), torch.__version__ is 2.13.0+cu130, torch.version.cuda is 13.0, nvcc release is 13.0, and disk free > 10GB.\n";
-pre_prompt += "If torch is 2.6 or CUDA is not 13.0, ok=false. Do not upgrade torch here; point at setup-mxmoe-env and doc/environment.md.\n";
-pre_prompt += "Set cuda_release to 13.0 when accepted. Put the env prefix in env_path. Put notes in details.\n";
+pre_prompt += "ok=true only if env mxmoe exists, Python is 3.12 (current interpreter 3.12.13), torch.__version__ is 2.11.0+cu128, torch.version.cuda is 12.8, nvcc release is 12.8, and disk free > 10GB.\n";
+pre_prompt += "If torch is 2.6 or CUDA is not 12.8, ok=false. Do not upgrade torch here; point at setup-mxmoe-env and doc/environment.md.\n";
+pre_prompt += "Set cuda_release to 12.8 when accepted. Put the env prefix in env_path. Put notes in details.\n";
 
 let pre = agent(pre_prompt, #{
     label: "precheck",
@@ -154,8 +154,8 @@ if pre == () || !pre.success || pre.output == () {
 if pre.output.ok != true {
     pause("infra", "Precheck not-ok: " + pre.output.summary + " | " + pre.output.details);
 }
-if pre.output.cuda_release != "13.0" {
-    pause("infra", "Precheck CUDA is not 13.0. Refusing 12.4 or an unresolved toolkit.");
+if pre.output.cuda_release != "12.8" {
+    pause("infra", "Precheck CUDA is not 12.8. Refusing 12.4 or an unresolved toolkit.");
 }
 log("Precheck OK: " + pre.output.summary);
 
@@ -207,14 +207,14 @@ fa_prompt += "Reuse or compile standalone flash-attn by executing doc/environmen
 fa_prompt += "This package is mandatory. skip_flash=" + skip_flash.to_string() + " may skip the compile only when version 2.8.3.post2 already passes the guide's numeric smoke on this GPU and this torch.\n";
 fa_prompt += "The section 4 FA3 source-cache patch belongs to the vLLM editable build, not this standalone package. Do not copy that patch here.\n";
 fa_prompt += "Do not edit doc/environment.md. If MXMOE_BUILD_ROOT is unset, stop rather than inventing a path.\n\n";
-fa_prompt += "Apply the guide's section 2 exports first, with this resolved CUDA 13.0 toolkit:\n";
+fa_prompt += "Apply the guide's section 2 exports first, with this resolved CUDA 12.8 toolkit:\n";
 fa_prompt += cuda_rules;
 fa_prompt += "Then set MAX_JOBS=" + max_jobs + " (guide default is 2). Requested TORCH_CUDA_ARCH_LIST=\"" + torch_arch_list + "\".\n";
 fa_prompt += "If this GPU is not SM80, reselect TORCH_CUDA_ARCH_LIST and FLASH_ATTN_CUDA_ARCHS for that GPU as the guide requires. Do not add 9.x unless the GPU is 9.x.\n";
 fa_prompt += "export CUDA_VISIBLE_DEVICES=" + gpu_devices + "\n";
 fa_prompt += "force_reinstall: " + force_reinstall.to_string() + "\n\n";
 fa_prompt += "Steps:\n";
-fa_prompt += "1) Confirm mxmoe python and torch 2.13.0+cu130. Do not reinstall torch.\n";
+fa_prompt += "1) Confirm mxmoe python and torch 2.11.0+cu128. Do not reinstall torch.\n";
 fa_prompt += "2) If force_reinstall is false and flash-attn 2.8.3.post2 already passes the guide's section 5 numeric smoke, reuse it regardless of skip_flash.\n";
 fa_prompt += "3) Otherwise run the section 3 flash-attn install block, even if skip_flash is true. Add --force-reinstall when repairing an installed incompatible build or when force_reinstall is true. Keep --no-cache-dir, --no-binary, -c constraints.txt, and --no-deps: a cached wheel can retain the old Torch/CUDA ABI even when FORCE_BUILD is set.\n";
 fa_prompt += "4) conda run --no-capture-output -n mxmoe python -c \"import flash_attn; print(flash_attn.__version__)\" must print 2.8.3.post2.\n\n";
@@ -285,7 +285,7 @@ phase("Report");
 
 let rep_prompt = "";
 rep_prompt += "Write a short markdown report of the flash-attn + lm_eval install for conda env mxmoe.\n";
-rep_prompt += "cuda_home resolved during precheck; release must be 13.0.\n";
+rep_prompt += "cuda_home resolved during precheck; release must be 12.8.\n";
 rep_prompt += "gpu: " + gpu_devices + "\n";
 rep_prompt += "precheck: " + pre.output.summary + "\n";
 rep_prompt += "lm_eval install: " + lm_r.output.summary + " ver=" + lm_r.output.version + "\n";

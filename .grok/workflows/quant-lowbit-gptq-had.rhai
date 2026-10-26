@@ -1,14 +1,14 @@
 // quant-lowbit-gptq-had: Experiment-only online GPTQ-Had for the 12 solved
 // mixed-precision qconfigs (ds2 and qwen2_moe; BPV 2.25 and 3.25; R=0, 0.5, 1).
 // Does not re-solve ILP, re-run calibration, call export_gptq_hf, run PPL or
-// zero-shot, or bench kernels. Shared environment is conda env mxmoe on CUDA 13.0
+// zero-shot, or bench kernels. Shared environment is conda env mxmoe on CUDA 12.8
 // (doc/environment.md). Does not install packages or use another env.
 // One physical GPU per model; that model's six configs run one after another.
 // Side effects: two GPUs, fake-quant HF trees under save_root. Reports are scratch only.
 //
 // Args (all optional; recipe defaults match the 2026-10-16 config package):
 //   env_name        default "mxmoe" (any other value is rejected)
-//   cuda_home       default "" (resolve CUDA 13.0; never 12.4 or newest cuda*)
+//   cuda_home       default "" (resolve CUDA 12.8; never 12.4 or newest cuda*)
 //   config_root     default "outputs/lowbit_allocations_20261016/mxmoe_lowbit_configs_12"
 //   save_root       default "/mnt/raid/tzj/mxmoe/lowbit_gptq_had_20261016"
 //   gpu_ds2         default "0"     (only ds2; never share with qwen2_moe)
@@ -22,10 +22,10 @@
 
 let meta = #{
     name: "quant-lowbit-gptq-had",
-    description: "Quant-only online GPTQ-Had in conda env mxmoe on CUDA 13.0 for the 12 solved ds2 and qwen2_moe low-bit qconfigs, one GPU per model, no ILP and no accuracy eval",
+    description: "Quant-only online GPTQ-Had in conda env mxmoe on CUDA 12.8 for the 12 solved ds2 and qwen2_moe low-bit qconfigs, one GPU per model, no ILP and no accuracy eval",
     when_to_use: "When the low-bit allocation package is already solved and those qconfigs should be quantized on the shared mxmoe stack",
     phases: [
-        #{ title: "Precheck", detail: "mxmoe, CUDA 13.0, checkpoints, config checksums, two distinct GPUs" },
+        #{ title: "Precheck", detail: "mxmoe, CUDA 12.8, checkpoints, config checksums, two distinct GPUs" },
         #{ title: "Quant", detail: "ds2 on gpu_ds2 || qwen2_moe on gpu_qwen; six configs sequential per GPU" },
         #{ title: "Report", detail: "scratch summary of BPV, peaks, and save paths" },
     ],
@@ -118,10 +118,10 @@ let preamble = "";
 preamble += "REQUIRED environment: conda env mxmoe only. See doc/environment.md. Do not install packages or use another env.\n";
 preamble += "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate mxmoe\n";
 preamble += "Python is that interpreter. Quant commands use conda run --no-capture-output -n mxmoe python -m ...\n";
-preamble += "Resolve CUDA 13.0 before any GPU command. Supplied cuda_home arg: '" + cuda_home + "'.\n";
-preamble += "If that arg is non-empty, it is the only candidate and its nvcc must be 13.0. Refuse 12.4 and 13.1.\n";
+preamble += "Resolve CUDA 12.8 before any GPU command. Supplied cuda_home arg: '" + cuda_home + "'.\n";
+preamble += "If that arg is non-empty, it is the only candidate and its nvcc must be 12.8. Refuse 12.4 and 13.1.\n";
 preamble += "If it is empty, do not export an empty CUDA_HOME and do not keep an inherited 12.4 or 13.1 value.\n";
-preamble += "Use process CUDA_HOME only when its nvcc is 13.0; else /usr/local/cuda-13.0 when that nvcc is 13.0. Never pick the newest cuda directory.\n";
+preamble += "Use process CUDA_HOME only when its nvcc is 12.8; else /usr/local/cuda-12.8 when that nvcc is 12.8. Never pick the newest cuda directory.\n";
 preamble += "Then export PATH=$CUDA_HOME/bin:$PATH and LD_LIBRARY_PATH from $CUDA_HOME/lib64 (or lib if lib64 is absent).\n";
 preamble += "cd the MxMoE git toplevel (git rev-parse --show-toplevel). export PYTHONPATH=$PWD:$PYTHONPATH\n";
 preamble += "export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=8\n";
@@ -144,7 +144,7 @@ let pre_p = "";
 pre_p += "Precheck only. Do not start quantization.\n";
 pre_p += preamble;
 pre_p += "Run these checks with the shell. ok=true only if every one exits 0.\n";
-pre_p += "1) mxmoe only: Python 3.12, torch 2.13.0+cu130, torch.version.cuda 13.0, nvcc release 13.0, transformers 5.19.0, fast_hadamard_transform imports. Do not pip install. Set cuda_release to that nvcc release.\n";
+pre_p += "1) mxmoe only: Python 3.12, torch 2.11.0+cu128, torch.version.cuda 12.8, nvcc release 12.8, transformers 5.19.0, fast_hadamard_transform imports. Do not pip install. Set cuda_release to that nvcc release.\n";
 pre_p += "2) conda run --no-capture-output -n mxmoe python project_config.py --check ds2 qwen2_moe exits 0. Do not rewrite .env.\n";
 pre_p += "3) config_root contains README.txt, provenance.json, summary.csv, SHA256SUMS, and these 12 files:\n";
 pre_p += "   ds2 and qwen2_moe; bpv2.25 and bpv3.25; r0, r0.5, r1; each with qconfig.json and expert_weight_map.json.\n";
@@ -153,7 +153,7 @@ pre_p += "5) nvidia-smi: GPU " + gpu_ds2 + " and GPU " + gpu_qwen + " exist and 
 pre_p += "   Record used/free MiB. A busy GPU is allowed when the only compute process is an existing mxmoe.quant.quant for that same model.\n";
 pre_p += "6) Confirm mxmoe/quant/quant.py eval accepts --gptq-nsamples, --device-map, --skip-eval, and --save-model.\n";
 pre_p += "summary: one line. details: checksum result, both checkpoint paths, both GPU free MiB, resolved save_root.\n";
-pre_p += "artifact_path: the resolved save_root. cuda_release must be 13.0 or ok=false.\n";
+pre_p += "artifact_path: the resolved save_root. cuda_release must be 12.8 or ok=false.\n";
 
 let pre = agent(pre_p, #{
     label: "precheck",
@@ -167,8 +167,8 @@ if pre == () || !pre.success || pre.output == () || pre.output.ok != true {
     }
     pause("infra", why);
 }
-if pre.output.cuda_release != "13.0" {
-    pause("infra", "Precheck CUDA is not 13.0. Refusing 12.4, 13.1, or an unresolved toolkit.");
+if pre.output.cuda_release != "12.8" {
+    pause("infra", "Precheck CUDA is not 12.8. Refusing 12.4, 13.1, or an unresolved toolkit.");
 }
 log("Precheck OK: " + pre.output.summary);
 
@@ -245,7 +245,7 @@ let report = "";
 report += "# quant-lowbit-gptq-had\n\n";
 report += "Scope: online GPTQ-Had fake-quant only. No ILP, no calibration, no PPL, no kernel bench.\n\n";
 report += "config_root: " + config_root + "\n\n";
-report += "env: mxmoe  CUDA: 13.0\n\n";
+report += "env: mxmoe  CUDA: 12.8\n\n";
 if pre.output.artifact_path != () && pre.output.artifact_path != "" {
     report += "save_root: " + pre.output.artifact_path + "\n\n";
 } else if save_root != "" {
