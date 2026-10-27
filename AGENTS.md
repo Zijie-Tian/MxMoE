@@ -179,6 +179,80 @@ Artifacts (gitignored large dumps): under `MXMOE_EXPORT_HF_ROOT` / default RAID 
 - Large exports belong on **RAID** (`/mnt/raid/tzj/...`), not `/mnt/data` (often full).
 - Do not bake machine-local export paths into tracked code defaults beyond the documented RAID default; operators may override with `MXMOE_EXPORT_HF_ROOT`.
 
+## Native grouped GEMM benchmark (F16 / W8A8 / W4A4)
+
+This is an **operator-only benchmark** with synthetic inputs and workload shapes, not model inference, PPL, or vLLM. It does not load checkpoints. Run each case on a single GPU, without TP, in the shared `mxmoe` environment. For RTX 3090 comparisons, use CUDA 12.8 and SM86 consistently; do not mix results from an older CUDA 12.1 build.
+
+### Implementation boundaries
+
+- `mxmoe/kernels/src/ref_impl.cuh`: standard CUTLASS wrappers `group_gemm_cutlass_f16`, `group_gemm_cutlass_w8a8`, and `group_gemm_cutlass_w4a4` in `mxmoe_ref`. Do not reintroduce separate W8A8/W4A4 implementation files or put operator implementations into the test driver.
+- `mxmoe/kernels/src/test.cu`: CLI, workload parsing, existing F16/MxMoE driver, and the shared `run_cutlass_integer<Bits>` / `run_cutlass_integer_group<Bits>` driver. W4A4 and W8A8 reuse `check_or_bench_group_gemm` and `bench_func`; do not duplicate their timing or checking loops.
+- `mxmoe/kernels/src/test_utils.h`: test-data generation, INT4 packing, integer reference calculation, and shared comparison/timing helpers. Integer outputs require exact comparison, not conversion to FP32 or a floating tolerance.
+- Refactor only project-owned kernel code when working on this benchmark; do not refactor unrelated code or submodules, including vendored CUTLASS and vLLM. Leave experiment changes uncommitted unless explicitly requested.
+
+### Build and invocation
+
+Follow `doc/environment.md` for the environment and host compiler. Keep local paths in shell variables: `MXMOE_KERNEL_BUILD` is the configured native build directory, and workload variables below name JSON or legacy text input files. Configure the native CMake project at `mxmoe/kernels/src` with `-DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc"`, `-DCMAKE_CUDA_ARCHITECTURES=86`, and `-DCMAKE_BUILD_TYPE=Release` for SM86. Clear inherited `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` when they refer to another environment.
+
+The `test` target still links generated MxMoE kernels. `-DGENERATED_DIR=...` selects their source directory; an integer-only comparison build may contain only generated F16 kernels. To measure MxMoE W4A4/W8A8, use a build containing those actual registered candidates, not an unmatched filter that produces `N/A`.
+
+```bash
+# Run from the repository root after configuring the shared environment/build.
+: "${MXMOE_KERNEL_BUILD:?Set the configured native build directory}"
+env -u NVCC_PREPEND_FLAGS -u NVCC_APPEND_FLAGS conda run --no-capture-output -n mxmoe \
+  cmake --build "$MXMOE_KERNEL_BUILD" --target test -j 8
+
+# Built-in integer correctness checks (no workload file required).
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  "$MXMOE_KERNEL_BUILD/test" check --backend cutlass_w8a8
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  "$MXMOE_KERNEL_BUILD/test" check --backend cutlass_w4a4
+
+# Exact checks on a small supplied workload; use bench to time larger workloads.
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  "$MXMOE_KERNEL_BUILD/test" check --backend cutlass_w4a4 --input "$W4A4_WORKLOAD"
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  "$MXMOE_KERNEL_BUILD/test" bench --backend cutlass_w4a4 --input "$W4A4_WORKLOAD"
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  "$MXMOE_KERNEL_BUILD/test" bench --backend cutlass_w8a8 --input "$W8A8_WORKLOAD"
+
+# Existing F16 reference path. The filter excludes generated MxMoE candidates;
+# CUTLASS F16 candidates still run. There is no cutlass_f16 CLI backend.
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  "$MXMOE_KERNEL_BUILD/test" check --input "$F16_WORKLOAD" --filter cutlass
+
+# Requires generated W4A4 MxMoE candidates in this build; use w8a8 for W8A8.
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  "$MXMOE_KERNEL_BUILD/test" bench --input "$W4A4_WORKLOAD" --filter groupgemm_hz_fused_w4a4
+```
+
+### Workloads and correctness
+
+The integer backends require every problem to match the selected W/A bits, `gsize=-1`, and `sym=true`. Dimensions must be positive; empty experts are rejected. W8A8 requires `K % 16 == 0`, W4A4 requires `K % 32 == 0`, and both require `N % 4 == 0`. A is row-major `[M,K]`; B is column-major `[K,N]`, equivalently row-major `[N,K]` weights. INT4 stores the even element in the low nibble and the odd element in the high nibble. Leading dimensions count logical elements, not compressed bytes.
+
+Example small W4A4 JSON, covering multiple K iterations and the `K=1408` tail:
+
+```json
+{
+  "layer-1": {
+    "gate_up": [
+      {"shape": [17, 128, 1408], "w_bits": 4, "a_bits": 4, "gsize": -1, "sym": true},
+      {"shape": [17, 128, 2816], "w_bits": 4, "a_bits": 4, "gsize": -1, "sym": true}
+    ]
+  }
+}
+```
+
+For W8A8, change both bit fields to 8. Legacy text is also accepted, e.g. `4x4x-1xsym 17x128x1408` (one problem per line). Workload files specify shapes/precision, not tensor values; the driver generates synthetic integers.
+
+`check` without `--input` validates only built-ins. With `--input`, empty inputs or any group beyond the host-reference limit (`sum(2*M*N*K) > 20,000,000`) return failure; built-in success must not be reported as supplied-workload correctness. Preserve the W8A8 exact accumulator case `33032065` and W4A4 non-periodic data, signed boundaries, and independent packing checks.
+
+### Timing and comparison rules
+
+Integer `bench` uses 30 warmups and 50 CUDA-event measurements, reporting the median as `median_ms`. Timing surrounds the grouped host launcher, including per-call initialization; input generation, allocation, packing, and reference calculation are outside the measured region. Results are printed to stdout; the integer backends do not use `--output` or `--filter`. The existing default-path CSV field `avg_time` also means median, not arithmetic mean.
+
+CUTLASS W4A4/W8A8 write **INT32 without dequantization**; MxMoE writes **FP16 with fused dequantization**. The standard integer wrappers each use a fixed tile, while MxMoE may select the fastest candidate. Disclose these differences rather than treating the ratio as a pure MMA speedup. For matched measurements, keep workload shapes, routing, GPU, CUDA version, and timing boundaries fixed, and record the candidate set. Aggregate throughput as total nominal FLOPs divided by summed median seconds; do not average per-case TFLOPS. Keep logs/results in ignored scratch directories, not tracked documentation or `.planning/` commits.
+
 ## Related conventions
 
 - Prefer minimal, necessary source diffs; keep generated kernels/build trees out of git (see `.gitignore`).

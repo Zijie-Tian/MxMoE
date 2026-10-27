@@ -449,7 +449,7 @@ struct GlobalTileC {
       half* smem_scale_b,                      //
       int lane, int warp_x, int warp_y         //
   ) {
-    auto col = lane % 4;
+    auto col = (lane % 4) * 2;  // Each MMA lane owns two adjacent output columns.
     auto row = lane / 4;
 
 #pragma unroll
@@ -736,7 +736,7 @@ struct QuantTileA {
   static constexpr int mmaK        = TileConfig::mmaK;
   static constexpr int WARP_TILE_M = TileConfig::WARP_TILE_M;
   static constexpr int WARP_TILE_K = TileConfig::WARP_TILE_K;
-  static constexpr int WARP_FRAG_M = TileConfig::WARP_FRAG_N;
+  static constexpr int WARP_FRAG_M = TileConfig::WARP_FRAG_M;  // A fragments span M, not N.
   static constexpr int FRAG_A_TH   = TileConfig::FRAG_A_TH;
 
   static constexpr int PACK_NUM       = QConfig::PACK_NUM;

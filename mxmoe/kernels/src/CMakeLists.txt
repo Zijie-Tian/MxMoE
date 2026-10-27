@@ -7,7 +7,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_COMPILER gcc)
 set(CMAKE_CXX_COMPILER g++)
 
-set(CMAKE_CUDA_ARCHITECTURES 80) # A100: 80 (was 89 for RTX 4090)
+set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architecture for the standalone benchmark")
 add_compile_definitions(COMPUTE_ARCH=${CMAKE_CUDA_ARCHITECTURES})
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress 128 -diag-suppress 2417, -diag-suppress 20050")
 
@@ -36,7 +36,7 @@ set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};${cccl_dir}/lib/cmake/cccl")
 # Targets
 #################################################################
 
-set(GENERATED_DIR "${CMAKE_SOURCE_DIR}/generated")
+set(GENERATED_DIR "${CMAKE_SOURCE_DIR}/generated" CACHE PATH "Generated grouped GEMM sources")
 include_directories(${GENERATED_DIR})
 
 file(GLOB GENERATED_CU_FILES "${GENERATED_DIR}/*.cu")

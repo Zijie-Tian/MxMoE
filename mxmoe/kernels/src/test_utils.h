@@ -4,8 +4,12 @@
 #include <thrust/host_vector.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <numeric>
 #include <string_view>
+#include <type_traits>
+#include <vector>
 
 #include "fmt/base.h"
 #include "fmt/core.h"
@@ -68,7 +72,7 @@ constexpr std::string_view type_name() {
 }
 
 template <typename T, typename Y>
-auto check_gemm(const host_vector<T>& a, const host_vector<Y>& b, string_view s, float tol = 1.0f) {
+auto check_gemm(const host_vector<T>& a, const host_vector<Y>& b, string_view s, float tol = 0.05f, float rtol = 0.005f) {
   if (!s.empty()) {
     fmt::print("{}: ", s);
   }
@@ -79,9 +83,18 @@ auto check_gemm(const host_vector<T>& a, const host_vector<Y>& b, string_view s,
 
   auto i = 0;
   for (; i < len; i++) {
-    if (fabsf(float(a[i]) - float(b[i])) > tol) {
-      pass = false;
-      break;
+    if constexpr (std::is_integral_v<T> && std::is_integral_v<Y>) {
+      // INT32 outputs must remain exact, including adjacent integers above 2^24.
+      if (a[i] != b[i]) {
+        pass = false;
+        break;
+      }
+    } else {
+      if (!std::isfinite(float(a[i])) || !std::isfinite(float(b[i])) ||
+          fabsf(float(a[i]) - float(b[i])) > tol + rtol * fabsf(float(a[i]))) {
+        pass = false;
+        break;
+      }
     }
   }
 
@@ -270,3 +283,107 @@ auto tag_name(std::string_view s, const std::tuple<Tiles...>& t) {
 }
 
 #define ErrorInfo(msg) std::runtime_error(fmt::format("{}:{}: {}", __FILE__, __LINE__, msg))
+
+namespace utils {
+
+struct IntegerGemmProblem {
+  int m{};
+  int n{};
+  int k{};
+  bool inexact_accumulator{false};
+};
+
+inline int8_t w8a8_pattern(int index) { return static_cast<int8_t>((index * 17 + 3) % 251 - 125); }
+
+inline void fill_w8a8(const IntegerGemmProblem& problem, std::vector<int8_t>& activation, std::vector<int8_t>& weight) {
+  activation.assign(static_cast<size_t>(problem.m) * problem.k, 0);
+  weight.assign(static_cast<size_t>(problem.n) * problem.k, 0);
+  if (problem.inexact_accumulator) {
+    // 127*127*2048 is FP32-exact. One input of 126 makes 33032065, which is not.
+    std::fill(activation.begin(), activation.end(), int8_t{127});
+    if (!activation.empty()) activation[0] = 126;
+    std::fill(weight.begin(), weight.end(), int8_t{127});
+    return;
+  }
+  for (size_t i = 0; i < activation.size(); ++i) activation[i] = w8a8_pattern(static_cast<int>(i));
+  for (size_t i = 0; i < weight.size(); ++i) weight[i] = w8a8_pattern(static_cast<int>(i) + 19);
+}
+
+inline int32_t reference_integer_dot(const std::vector<int8_t>& activation, const std::vector<int8_t>& weight,
+                                     int k, int row, int col) {
+  int32_t acc = 0;
+  const int8_t* a_row = activation.data() + static_cast<size_t>(row) * k;
+  const int8_t* b_column = weight.data() + static_cast<size_t>(col) * k;
+  for (int t = 0; t < k; ++t) acc += int32_t(a_row[t]) * int32_t(b_column[t]);
+  return acc;
+}
+
+inline int8_t w4a4_value(int problem, int operand, int outer, int inner) {
+  uint32_t mixed = static_cast<uint32_t>(problem) * 0x9E3779B9u;
+  mixed ^= static_cast<uint32_t>(operand) * 0x85EBCA6Bu;
+  mixed ^= static_cast<uint32_t>(outer) * 0xC2B2AE35u;
+  mixed ^= static_cast<uint32_t>(inner) * 0x165667B1u;
+  mixed ^= mixed >> 16;
+  return static_cast<int8_t>(static_cast<int>(mixed & 15u) - 8);
+}
+
+inline auto pack_cutlass_int4(const std::vector<int8_t>& logical) -> std::vector<uint8_t> {
+  if (logical.size() % 2 != 0) throw ErrorInfo("INT4 logical length must be even");
+  std::vector<uint8_t> packed(logical.size() / 2, 0);
+  for (size_t i = 0; i < logical.size(); ++i) {
+    const int value = logical[i];
+    if (value < -8 || value > 7) throw ErrorInfo(fmt::format("INT4 value {} is outside [-8, 7]", value));
+    const auto nibble = static_cast<uint8_t>(value & 0x0f);
+    if ((i % 2) == 0) packed[i / 2] = nibble;
+    else packed[i / 2] = static_cast<uint8_t>(packed[i / 2] | (nibble << 4));
+  }
+  for (size_t i = 0; i < logical.size(); ++i) {
+    const int nibble = (packed[i / 2] >> ((i % 2) * 4)) & 0x0f;
+    const int decoded = (nibble & 0x8) ? (nibble | ~0x0f) : nibble;
+    if (decoded != logical[i]) {
+      throw ErrorInfo(fmt::format("CUTLASS INT4 unpack mismatch at {}: packed {} logical {}", i, decoded, logical[i]));
+    }
+  }
+  return packed;
+}
+
+inline void fill_w4a4(int problem_index, const IntegerGemmProblem& problem, std::vector<int8_t>& activation,
+                      std::vector<int8_t>& weight) {
+  const int m = problem.m;
+  const int n = problem.n;
+  const int k = problem.k;
+  activation.resize(static_cast<size_t>(m) * k);
+  weight.resize(static_cast<size_t>(n) * k);
+  for (int row = 0; row < m; ++row) {
+    for (int inner = 0; inner < k; ++inner) {
+      activation[static_cast<size_t>(row) * k + inner] = w4a4_value(problem_index, 0, row, inner);
+    }
+  }
+  for (int col = 0; col < n; ++col) {
+    for (int inner = 0; inner < k; ++inner) {
+      weight[static_cast<size_t>(col) * k + inner] = w4a4_value(problem_index, 1, col, inner);
+    }
+  }
+  activation[0] = -8;
+  activation[1] = 7;
+  weight[0] = 7;
+  weight[1] = -8;
+  if (m > 1) {
+    activation[k] = 7;
+    activation[k + 1] = -8;
+  }
+  if (n > 1) {
+    weight[k] = -8;
+    weight[k + 1] = 7;
+  }
+  auto later_rows_differ = [](const std::vector<int8_t>& data, int stride) {
+    for (int inner = 2; inner < stride; ++inner) {
+      if (data[inner] != data[stride + inner]) return true;
+    }
+    return false;
+  };
+  if (m > 1 && !later_rows_differ(activation, k)) throw ErrorInfo("W4A4 activation rows are still periodic");
+  if (n > 1 && !later_rows_differ(weight, k)) throw ErrorInfo("W4A4 weight columns are still periodic");
+}
+
+}  // namespace utils

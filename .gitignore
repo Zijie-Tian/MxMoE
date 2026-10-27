@@ -37,3 +37,4 @@ qconfigs/*
 bits_model-*.lp
 # Agent/workflow scratch notes (not source)
 scratch/
+/.planning/

@@ -9,7 +9,7 @@
 #include <cutlass/layout/matrix.h>
 #include <cutlass/util/device_memory.h>
 #include <cutlass/util/reference/device/gemm.h>
-
+#include <cutlass/integer_subbyte.h>
 #include "cta_gemm.cuh"
 #include "layout.cuh"
 
@@ -24,7 +24,7 @@ __host__ __device__ inline T ceil_div(T a, T b) {
 namespace mxmoe_ref {
 template <typename MatricesInfo, typename TileConfig,
           GroupScheduleMode GroupSchedule = GroupScheduleMode::kDeviceOnly>
-void group_gemm_cutlass_ref(             //
+void group_gemm_cutlass_f16(             //
     typename MatricesInfo::TA** ptr_As,  //
     typename MatricesInfo::TB** ptr_Bs,  //
     typename MatricesInfo::TC** ptr_Cs,  //
@@ -103,6 +103,136 @@ void group_gemm_cutlass_ref(             //
   size_t workspace_size = kernel.get_workspace_size(args);
   cutlass::DeviceAllocation<uint8_t> workspace(workspace_size);
 
+  CUTLASS_CHECK(kernel.initialize(args, workspace.get()));
+  CUTLASS_CHECK(kernel.run());
+}
+
+// Uniform symmetric W8A8. A is row-major MxK, B is column-major KxN, and C/D are
+// row-major INT32. This does not dequantize.
+inline void group_gemm_cutlass_w8a8(     //
+    int8_t** ptr_As,                     //
+    int8_t** ptr_Bs,                     //
+    int32_t** ptr_Cs,                    //
+    int32_t** ptr_Ds,                    //
+    int64_t* ldas,                       //
+    int64_t* ldbs,                       //
+    int64_t* ldcs,                       //
+    int64_t* ldds,                       //
+    GemmCoord* problem_sizes,            //
+    GemmCoord* h_problem_sizes,          //
+    int problem_count                    //
+) {
+  using ElementA           = int8_t;
+  using ElementB           = int8_t;
+  using ElementC           = int32_t;
+  using ElementAccumulator = int32_t;
+  constexpr int kAlignment = 16;
+
+  using cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
+  // Integer compute avoids the FP32 epilogue narrowing values above 2^24.
+  using Epilogue = cutlass::epilogue::thread::LinearCombination<
+      ElementC, 128 / cutlass::sizeof_bits<ElementC>::value, ElementAccumulator, ElementAccumulator>;
+
+  using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<                 //
+      ElementA, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, kAlignment, //
+      ElementB, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone,          //
+      kAlignment,                                                                        //
+      ElementC, cutlass::layout::RowMajor,                                               //
+      ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,           //
+      cutlass::gemm::GemmShape<64, 128, 128>,                                            //
+      cutlass::gemm::GemmShape<32, 64, 128>,                                             //
+      cutlass::gemm::GemmShape<16, 8, 32>,                                               //
+      Epilogue,                                                                          //
+      GemmBatchedIdentityThreadblockSwizzle,                                             //
+      3,                                                                                 //
+      GroupScheduleMode::kDeviceOnly>::GemmKernel;
+
+  using GroupGemm = cutlass::gemm::device::GemmGrouped<GemmKernel>;
+  auto args       = typename GroupGemm::Arguments(                                 //
+      problem_sizes,                                                               //
+      problem_count,                                                               //
+      GroupGemm::sufficient(h_problem_sizes, problem_count),                       //
+      typename Epilogue::Params(ElementAccumulator(1), ElementAccumulator(0)),     //
+      ptr_As,                                                                      //
+      ptr_Bs,                                                                      //
+      ptr_Cs,                                                                      //
+      ptr_Ds,                                                                      //
+      ldas,                                                                        //
+      ldbs,                                                                        //
+      ldcs,                                                                        //
+      ldds,                                                                        //
+      h_problem_sizes                                                              //
+  );
+
+  GroupGemm kernel;
+  CUTLASS_CHECK(GroupGemm::can_implement(args));
+  const size_t workspace_size = kernel.get_workspace_size(args);
+  cutlass::DeviceAllocation<uint8_t> workspace(workspace_size);
+  CUTLASS_CHECK(kernel.initialize(args, workspace.get()));
+  CUTLASS_CHECK(kernel.run());
+}
+
+// Uniform symmetric W4A4. Pointers address CUTLASS packed int4b_t storage
+// (two logical elements per byte, even element in the low nibble). Leading
+// dimensions are logical elements, not compressed bytes. Output is INT32.
+inline void group_gemm_cutlass_w4a4(     //
+    cutlass::int4b_t** ptr_As,           //
+    cutlass::int4b_t** ptr_Bs,           //
+    int32_t** ptr_Cs,                    //
+    int32_t** ptr_Ds,                    //
+    int64_t* ldas,                       //
+    int64_t* ldbs,                       //
+    int64_t* ldcs,                       //
+    int64_t* ldds,                       //
+    GemmCoord* problem_sizes,            //
+    GemmCoord* h_problem_sizes,          //
+    int problem_count                    //
+) {
+  using ElementA           = cutlass::int4b_t;
+  using ElementB           = cutlass::int4b_t;
+  using ElementC           = int32_t;
+  using ElementAccumulator = int32_t;
+  constexpr int kAlignment = 32;
+
+  using cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
+  using Epilogue = cutlass::epilogue::thread::LinearCombination<
+      ElementC, 128 / cutlass::sizeof_bits<ElementC>::value, ElementAccumulator, ElementAccumulator>;
+
+  using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<                 //
+      ElementA, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, kAlignment, //
+      ElementB, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone,          //
+      kAlignment,                                                                        //
+      ElementC, cutlass::layout::RowMajor,                                               //
+      ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,           //
+      cutlass::gemm::GemmShape<64, 128, 256>,                                            //
+      cutlass::gemm::GemmShape<32, 64, 256>,                                             //
+      cutlass::gemm::GemmShape<16, 8, 64>,                                               //
+      Epilogue,                                                                          //
+      GemmBatchedIdentityThreadblockSwizzle,                                             //
+      3,                                                                                 //
+      GroupScheduleMode::kDeviceOnly>::GemmKernel;
+
+  using GroupGemm = cutlass::gemm::device::GemmGrouped<GemmKernel>;
+  auto args       = typename GroupGemm::Arguments(                                 //
+      problem_sizes,                                                               //
+      problem_count,                                                               //
+      GroupGemm::sufficient(h_problem_sizes, problem_count),                       //
+      typename Epilogue::Params(ElementAccumulator(1), ElementAccumulator(0)),     //
+      ptr_As,                                                                      //
+      ptr_Bs,                                                                      //
+      ptr_Cs,                                                                      //
+      ptr_Ds,                                                                      //
+      ldas,                                                                        //
+      ldbs,                                                                        //
+      ldcs,                                                                        //
+      ldds,                                                                        //
+      h_problem_sizes                                                              //
+  );
+
+  GroupGemm kernel;
+  CUTLASS_CHECK(GroupGemm::can_implement(args));
+  const size_t workspace_size = kernel.get_workspace_size(args);
+  cutlass::DeviceAllocation<uint8_t> workspace(workspace_size);
   CUTLASS_CHECK(kernel.initialize(args, workspace.get()));
   CUTLASS_CHECK(kernel.run());
 }

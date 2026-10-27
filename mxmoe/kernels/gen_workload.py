@@ -91,7 +91,7 @@ def generate_workload_from_gate_trace(trace_file: str, num_total_tokens: int, la
         # handle shared experts
         if num_shared_experts != 0:
             shapes["gate_up"].append({"shape": [int(num_total_tokens), N*2*num_shared_experts, K], **get_linear_block_qcfg(str(num_experts), "gate")})
-            shapes["down"].append({"shape": [int(num_total_tokens), K, N*num_shared_experts], **get_linear_block_qcfg(str(num_experts), "gate")})
+            shapes["down"].append({"shape": [int(num_total_tokens), K, N*num_shared_experts], **get_linear_block_qcfg(str(num_experts), "down")})
 
         result[f"layer-{layer_idx}"] = shapes
     

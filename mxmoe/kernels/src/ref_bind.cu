@@ -23,9 +23,9 @@ using namespace mxmoe_ref;
 using torch::Tensor;
 
 namespace mxmoe {
-auto ck0 = group_gemm_cutlass_ref<tiled_gemm::RCR_FP16FP16FP16, tiled_gemm::TileConfig<128, 128, 64, 2, 4, 1, 3>>;
-auto ck1 = group_gemm_cutlass_ref<tiled_gemm::RCR_FP16FP16FP16, tiled_gemm::TileConfig<128, 128, 32, 2, 2, 1, 4>>;
-auto ck2 = group_gemm_cutlass_ref<tiled_gemm::RCR_FP16FP16FP16, tiled_gemm::TileConfig<128, 128, 64, 1, 4, 1, 3>>;
+auto ck0 = group_gemm_cutlass_f16<tiled_gemm::RCR_FP16FP16FP16, tiled_gemm::TileConfig<128, 128, 64, 2, 4, 1, 3>>;
+auto ck1 = group_gemm_cutlass_f16<tiled_gemm::RCR_FP16FP16FP16, tiled_gemm::TileConfig<128, 128, 32, 2, 2, 1, 4>>;
+auto ck2 = group_gemm_cutlass_f16<tiled_gemm::RCR_FP16FP16FP16, tiled_gemm::TileConfig<128, 128, 64, 1, 4, 1, 3>>;
 
 auto mxmoe_w4a16_w8a8_bs64   = hz_fused_w4a16_w8a8_bs64;
 auto mxmoe_w4a16_w8a8_bs128  = hz_fused_w4a16_w8a8_bs128;

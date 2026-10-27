@@ -87,6 +87,40 @@ We explore the automated design of mixed-precision quantization scheme for MoE m
     python run_mxmoe_gg.py --model qwen2_moe --bs 8192 --layer 11 --qconfig <QCONFIG> --tile_config <TCONFIG>
     ```
 
+The standalone C++ `test` target consumes workload JSON and does not load model
+checkpoints. Its `check` mode compares packed low-bit GEMM output with CUTLASS
+using the corresponding dequantized FP16 inputs; run this before `bench` when
+changing precision or tile configurations. Activation quantization and packing
+are outside the timed region. Timing wraps the host launcher, including its
+per-call scheduling metadata allocation/copy/free; it is not a bare device-kernel
+latency. The existing CSV column `avg_time` contains the median in milliseconds.
+Native builds accept `-DCMAKE_CUDA_ARCHITECTURES=86` for SM86 and
+`-DGENERATED_DIR=<generated-source-directory>` to keep generated benchmark
+variants isolated. The paper uses RTX 4090, so results on another GPU must state
+that difference and identify the allocation policy and routing trace used.
+
+The standard integer baselines are selected with `--backend cutlass_w8a8` or
+`--backend cutlass_w4a4`. Both use the operators in `ref_impl.cuh` and one shared
+integer runner in `test.cu`; test-data generation, INT4 packing, and exact integer
+comparison live in `test_utils.h`. They reuse the existing grouped check and
+timing helpers, rather than maintaining separate timing loops for each bit width.
+The input buffers contain synthetic signed integers (packed for INT4), and the
+output is INT32 without dequantization, not the fused FP16 output of MxMoE.
+Quantization and packing remain outside the timed region.
+
+```bash
+# MXMOE_KERNEL_BUILD points to your configured native build directory.
+conda run --no-capture-output -n mxmoe "$MXMOE_KERNEL_BUILD/test" check --backend cutlass_w8a8
+conda run --no-capture-output -n mxmoe "$MXMOE_KERNEL_BUILD/test" check --backend cutlass_w4a4
+```
+
+Without `--input`, the integer backends use built-in cases. With `--input`, the
+workload must have matching uniform symmetric precision and `gsize=-1`. `check`
+compares INT32 values exactly; empty inputs or any group exceeding the host
+reference limit of 20 million nominal operations (`2*M*N*K`) return failure
+rather than claiming that the workload was validated. `bench` uses 30 warmups
+and 50 CUDA-event measurements and reports `median_ms` for the grouped call.
+
 ## 👀 Limitations
 
 ⚠️ MxMoE is mainly test on RTX-4090. The current implementation cannot fully utilize the performance of hopper and later GPU architectures.

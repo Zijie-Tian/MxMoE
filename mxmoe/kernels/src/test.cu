@@ -3,11 +3,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <random>
 #include <sstream>
 #include <thread>
+#include <cuda_runtime.h>
 #include <vector>
 
 #include "cuda_utils.cuh"
@@ -15,6 +17,7 @@
 // #include "generated/seq_launch_decl.cuh"
 // #include "generated/ms_launch_decl.cuh"
 #include "ref_impl.cuh"
+
 #include "registry.cuh"
 #include "test_utils.h"
 
@@ -101,7 +104,7 @@ namespace utils {
 template <typename F, typename Res, typename Ref>
 auto check_or_bench_group_gemm(                                  //
     CaseMode mode, std::string desc, bool is_gpu_kernel,         //
-    host_vector<GemmCoord> problem_sizes,                        //
+    const host_vector<GemmCoord>& problem_sizes,                 //
     F&& kernel, Res&& get_res, Ref&& get_ref,                    //
     bool verbose,                                                //
     int warm_up = 30, int bench_iter = 50, int sec_at_most = 30  //
@@ -127,7 +130,7 @@ auto check_or_bench_group_gemm(                                  //
       break;
     }
     // get coordinate in the problem
-    pos -= prefixsum_out[problem_idx - 1];
+    pos -= problem_idx == 0 ? 0 : prefixsum_out[problem_idx - 1];
     auto coord = std::make_pair(pos / problem_sizes[problem_idx].n(), pos % problem_sizes[problem_idx].n());
 
     return std::make_pair(problem_idx, coord);
@@ -144,9 +147,14 @@ auto check_or_bench_group_gemm(                                  //
     if (pos != -1) {
       auto [pidx, coord] = get_coord(pos);
       fmt::println("pos: {}, problem: {}, coord: {}", pos, pidx, coord);
-      auto pld = problem_sizes[pidx].n();
-      dump_arr(ref.data() + pos, pld, {8, 8}, "ref");
-      dump_arr(res.data() + pos, pld, {8, 8}, "res");
+      if constexpr (std::is_integral_v<typename std::decay_t<decltype(ref)>::value_type>) {
+        fmt::println("ref: {}, res: {}", ref[pos], res[pos]);
+      } else {
+        auto pld = problem_sizes[pidx].n();
+        dump_arr(ref.data() + pos, pld, {8, 8}, "ref");
+        dump_arr(res.data() + pos, pld, {8, 8}, "res");
+      }
+      throw ErrorInfo(fmt::format("Grouped GEMM correctness failed: {}", desc));
     }
     return std::make_pair(std::make_pair(0., 0.), desc);
   } else {
@@ -309,7 +317,7 @@ struct Input {
                                      (const void*)(d_fq_b.data().get()), 2 * N * K, cudaMemcpyDeviceToDevice));
           checkCudaErrors(cudaMemcpy((void*)(qinp.scale_zp_data.data().get() + cur_scale_zp_size),
                                      (const void*)(permuted_scale_a.data()), 2 * scale_a_size, cudaMemcpyHostToDevice));
-          checkCudaErrors(cudaMemcpy((void*)(qinp.scale_zp_data.data().get() + cur_scale_zp_size + M),
+          checkCudaErrors(cudaMemcpy((void*)(qinp.scale_zp_data.data().get() + cur_scale_zp_size + scale_a_size),
                                      (const void*)(permuted_scale_b.data()), 2 * scale_b_size, cudaMemcpyHostToDevice));
 
           off_pack_a += M * K / pack_num_a;
@@ -332,10 +340,10 @@ struct Input {
               d_fq_b.data().get(),                         //
               d_qb.data().get(),                           //
               d_scale_b.data().get(),                      //
-              N * K / real_gsize, real_gsize, a_bits, sym  //
+              N * K / real_gsize, real_gsize, w_bits, sym  //
           );
           auto qb             = host_vector<int>(d_qb);
-          auto permuted_scale = permute_scale(host_vector<half>(d_scale_b), N, K, real_gsize, a_bits, sym);
+          auto permuted_scale = permute_scale(host_vector<half>(d_scale_b), N, K, real_gsize, w_bits, sym);
           auto permuted_b     = permute_weight(qb, N, K, w_bits, PermuteMode::Row);
           auto h_pack_b       = pack_weightonly(permuted_b, N, K, w_bits);
 
@@ -353,7 +361,7 @@ struct Input {
 
           checkCudaErrors(cudaMemcpy((void*)(qinp.pack_data_a.data().get() + cur_pack_a_size), (const void*)(As[i]),
                                      2 * M * K / pack_num_a, cudaMemcpyDeviceToDevice));
-          checkCudaErrors(cudaMemcpy((void*)(qinp.fq_data_a.data().get() + cur_pack_a_size), (const void*)(As[i]),
+          checkCudaErrors(cudaMemcpy((void*)(qinp.fq_data_a.data().get() + cur_fq_a_size), (const void*)(As[i]),
                                      2 * M * K, cudaMemcpyDeviceToDevice));
 
           checkCudaErrors(cudaMemcpy((void*)(qinp.pack_data_b.data().get() + cur_pack_b_size),
@@ -380,26 +388,18 @@ struct Input {
 
         // no quant
         if (!is_quant) {
-          // qinp.pack_data_a.resize(qinp.pack_data_a.size() + M * K);
-          // qinp.fq_data_a.resize(qinp.fq_data_a.size() + M * K);
-          // qinp.pack_data_b.resize(qinp.pack_data_b.size() + N * K);
-          // qinp.fq_data_b.resize(qinp.fq_data_b.size() + N * K);
-
-          // checkCudaErrors(
-          //     cudaMemcpy(qinp.pack_data_a.data().get() + off_pack_a, As[i], M * K * 2, cudaMemcpyDeviceToDevice));
-          // checkCudaErrors(
-          //     cudaMemcpy(qinp.fq_data_a.data().get() + off_fq_a, As[i], M * K * 2, cudaMemcpyDeviceToDevice));
-          // checkCudaErrors(
-          //     cudaMemcpy(qinp.pack_data_b.data().get() + off_pack_b, Bs[i], N * K * 2, cudaMemcpyDeviceToDevice));
-          // checkCudaErrors(
-          //     cudaMemcpy(qinp.fq_data_b.data().get() + off_fq_b, Bs[i], N * K * 2, cudaMemcpyDeviceToDevice));
-
-          // off_pack_a += M * K / pack_num_a;
-          // off_pack_b += N * K / pack_num_b;
-          // off_fq_a += M * K;
-          // off_fq_b += N * K;
-          // off_scale_zp += 0;
-          // continue;
+          qinp.pack_data_a.resize(qinp.pack_data_a.size() + M * K);
+          qinp.fq_data_a.resize(qinp.fq_data_a.size() + M * K);
+          qinp.pack_data_b.resize(qinp.pack_data_b.size() + N * K);
+          qinp.fq_data_b.resize(qinp.fq_data_b.size() + N * K);
+          checkCudaErrors(cudaMemcpy(qinp.pack_data_a.data().get() + off_pack_a, As[i], M * K * 2, cudaMemcpyDeviceToDevice));
+          checkCudaErrors(cudaMemcpy(qinp.fq_data_a.data().get() + off_fq_a, As[i], M * K * 2, cudaMemcpyDeviceToDevice));
+          checkCudaErrors(cudaMemcpy(qinp.pack_data_b.data().get() + off_pack_b, Bs[i], N * K * 2, cudaMemcpyDeviceToDevice));
+          checkCudaErrors(cudaMemcpy(qinp.fq_data_b.data().get() + off_fq_b, Bs[i], N * K * 2, cudaMemcpyDeviceToDevice));
+          off_pack_a += M * K;
+          off_pack_b += N * K;
+          off_fq_a += M * K;
+          off_fq_b += N * K;
         }
       }
 
@@ -515,10 +515,9 @@ struct Input {
       ptr_Cs.push_back(Cs.data().get() + off_c);
       ptr_Ds.push_back(Cs.data().get() + off_c);
 
-      q_inp.pack_As.push_back(As.data().get()+off_a);
-      q_inp.pack_Bs.push_back(Bs.data().get()+off_b);
-      // q_inp.pack_As.push_back(q_inp.pack_data_a.data().get() + off_a);
-      // q_inp.pack_Bs.push_back(q_inp.pack_data_b.data().get() + off_b);
+      // Each problem reads its packed segment, not the original FP16 bytes.
+      q_inp.pack_As.push_back(q_inp.pack_data_a.data().get() + off_a);
+      q_inp.pack_Bs.push_back(q_inp.pack_data_b.data().get() + off_b);
       q_inp.scale_zp_a.push_back(q_inp.scale_zp_data.data().get() + off_scale_zp);
       q_inp.scale_zp_b.push_back(q_inp.scale_zp_data.data().get() + off_scale_zp + scale_size_a);
 
@@ -588,10 +587,9 @@ struct Input {
 
       ptr_Cs.push_back(Cs.data().get() + off_c);
       ptr_Ds.push_back(Cs.data().get() + off_c);
-      // inp.fq_As.push_back(inp.fq_data_a.data().get() + off_a);
-      // inp.fq_Bs.push_back(inp.fq_data_b.data().get() + off_b);
-      inp.fq_As.push_back(As.data().get() + off_a);
-      inp.fq_Bs.push_back(Bs.data().get() + off_b);
+      // CUTLASS checks the same quantized values after dequantization to FP16.
+      inp.fq_As.push_back(inp.fq_data_a.data().get() + off_a);
+      inp.fq_Bs.push_back(inp.fq_data_b.data().get() + off_b);
 
       off_a += M * K;
       off_b += N * K;
@@ -692,7 +690,7 @@ using BenchResult = std::pair<std::pair<double, double>, std::string>;
 
 template <typename TA, typename TB, typename TC>
 auto bench_one_case(                  //
-    Input<TA, TB, TC> input,          //
+    Input<TA, TB, TC>& input,         //
     CaseMode mode, bool verbose,      //
     std::vector<std::string> filter,  //
     std::string out_file = ""s        //
@@ -723,17 +721,20 @@ auto bench_one_case(                  //
   };
 
   if (mode == CaseMode::CHECK) {
-    std::apply(mxmoe_ref::group_gemm_cutlass_ref<Minfo, TileConfig<128, 128, 64, 1, 2, 1, 3>>,
+    std::apply(mxmoe_ref::group_gemm_cutlass_f16<Minfo, TileConfig<128, 128, 64, 1, 2, 1, 3>>,
                input.get_fake_quant_ptr());
     input.h_Refs = input.Cs;
   }
 
-#if COMPUTE_ARCH == 80
+#if COMPUTE_ARCH == 80 || COMPUTE_ARCH == 86
   auto fp16_tile_cfgs = std::make_tuple(       //
       TileConfig<128, 256, 32, 2, 4, 1, 3>{},  //
+#if COMPUTE_ARCH == 80
+      // These two candidates exceed SM86's per-block shared-memory capacity.
       TileConfig<128, 256, 64, 2, 4, 1, 3>{},  //
 
       TileConfig<128, 128, 64, 2, 2, 1, 4>{},  //
+#endif
       TileConfig<128, 128, 64, 2, 2, 1, 3>{},  //
       TileConfig<128, 128, 32, 2, 2, 1, 3>{},  //
 
@@ -774,7 +775,7 @@ auto bench_one_case(                  //
   {
     auto run = [&](auto t) {
       using Tile  = decltype(t);
-      auto kernel = mxmoe_ref::group_gemm_cutlass_ref<Minfo, Tile>;
+      auto kernel = mxmoe_ref::group_gemm_cutlass_f16<Minfo, Tile>;
       return check_or_bench(input, kernel, tag_name<Tile>("cutlass"), input.get_fake_quant_ptr());
     };
     std::apply([&](auto... t) { (bench_results["cutlass"].push_back(run(t)), ...); }, fp16_tile_cfgs);
@@ -945,6 +946,153 @@ auto bench_input_file(fs::path filename, CaseMode mode, bool verbose, std::vecto
   }
 }
 
+// Only operand preparation differs: INT4 uses packed bytes, INT8 uses signed bytes.
+// Checking and timing go through the same helpers as the F16/MxMoE path.
+template <int Bits>
+void run_cutlass_integer_group(const std::string& name, const std::vector<IntegerGemmProblem>& problems,
+                               CaseMode mode) {
+  static_assert(Bits == 4 || Bits == 8);
+  using Element = std::conditional_t<Bits == 4, cutlass::int4b_t, int8_t>;
+  if (problems.empty()) throw ErrorInfo(fmt::format("{} has no problems", name));
+  const int count = static_cast<int>(problems.size());
+  host_vector<GemmCoord> host_problems(count);
+  host_vector<int64_t> host_k(count), host_n(count);
+  std::vector<size_t> offsets(count + 1, 0);
+  long long flops = 0;
+  for (int i = 0; i < count; ++i) {
+    const auto& p = problems[i];
+    if (p.m <= 0 || p.n <= 0 || p.k <= 0) {
+      throw ErrorInfo(fmt::format("{} has unsupported shape ({}, {}, {}); empty experts are not in this path",
+                                  name, p.m, p.n, p.k));
+    }
+    if (p.k % (128 / Bits) != 0)
+      throw ErrorInfo(fmt::format("{} K={} is not a multiple of {}", name, p.k, 128 / Bits));
+    if (p.n % 4 != 0) throw ErrorInfo(fmt::format("{} N={} is not a multiple of 4", name, p.n));
+    host_problems[i] = GemmCoord(p.m, p.n, p.k);
+    host_k[i] = p.k;
+    host_n[i] = p.n;
+    offsets[i + 1] = offsets[i] + size_t(p.m) * p.n;
+    flops += 2LL * p.m * p.n * p.k;
+  }
+
+  std::vector<std::vector<int8_t>> host_a(count), host_b(count);
+  std::vector<cutlass::DeviceAllocation<Element>> a(count), b(count);
+  device_vector<int32_t> output(offsets.back(), int32_t{0x7f7f7f7f});
+  host_vector<Element*> host_ptr_a(count), host_ptr_b(count);
+  host_vector<int32_t*> host_ptr_c(count);
+  for (int i = 0; i < count; ++i) {
+    if constexpr (Bits == 4) fill_w4a4(i, problems[i], host_a[i], host_b[i]);
+    else fill_w8a8(problems[i], host_a[i], host_b[i]);
+    // CUTLASS allocations count logical elements, including for sub-byte types.
+    a[i].reset(host_a[i].size());
+    b[i].reset(host_b[i].size());
+    if constexpr (Bits == 4) {
+      auto packed_a = pack_cutlass_int4(host_a[i]);
+      auto packed_b = pack_cutlass_int4(host_b[i]);
+      a[i].copy_from_host(reinterpret_cast<const Element*>(packed_a.data()));
+      b[i].copy_from_host(reinterpret_cast<const Element*>(packed_b.data()));
+    } else {
+      a[i].copy_from_host(host_a[i].data());
+      b[i].copy_from_host(host_b[i].data());
+    }
+    host_ptr_a[i] = a[i].get();
+    host_ptr_b[i] = b[i].get();
+    host_ptr_c[i] = output.data().get() + offsets[i];
+  }
+  device_vector<Element*> ptr_a = host_ptr_a, ptr_b = host_ptr_b;
+  device_vector<int32_t*> ptr_c = host_ptr_c;
+  device_vector<int64_t> ld_k = host_k, ld_n = host_n;
+  device_vector<GemmCoord> sizes = host_problems;
+  constexpr auto kernel = [] {
+    if constexpr (Bits == 4) return mxmoe_ref::group_gemm_cutlass_w4a4;
+    else return mxmoe_ref::group_gemm_cutlass_w8a8;
+  }();
+  auto launch = [&] {
+    kernel(ptr_a.data().get(), ptr_b.data().get(), ptr_c.data().get(), ptr_c.data().get(),
+           ld_k.data().get(), ld_k.data().get(), ld_n.data().get(), ld_n.data().get(),
+           sizes.data().get(), host_problems.data(), count);
+  };
+  host_vector<int32_t> result, reference;
+  auto get_result = [&]() -> const host_vector<int32_t>& {
+    result = output;
+    return result;
+  };
+  auto get_reference = [&]() -> const host_vector<int32_t>& {
+    reference.resize(offsets.back());
+    for (int i = 0; i < count; ++i) {
+      const auto& p = problems[i];
+      for (int row = 0; row < p.m; ++row) {
+        for (int col = 0; col < p.n; ++col) {
+          reference[offsets[i] + size_t(row) * p.n + col] = reference_integer_dot(host_a[i], host_b[i], p.k, row, col);
+        }
+      }
+    }
+    return reference;
+  };
+  // Keep the existing log field for consumers; it counts 2*M*N*K, not MACs.
+  fmt::println(">>> {} problems={} macs={}", name, count, flops);
+  auto measured = check_or_bench_group_gemm(mode, name, true, host_problems, launch, get_result, get_reference,
+                                           false, 30, 50, std::numeric_limits<int>::max());
+  if (mode == CaseMode::BENCH) {
+    fmt::println("  median_ms={:.4f} timing_scope=grouped_call output=int32 dequant=false", measured.first.first);
+  } else {
+    for (int i = 0; i < count; ++i) {
+      const auto& p = problems[i];
+      if (p.inexact_accumulator) {
+        if (result[offsets[i]] != 33032065) throw ErrorInfo("FP32-inexact accumulator check failed");
+        fmt::println("  problem {} ({},{},{}) exact, accumulator {} is not FP32-representable",
+                     i, p.m, p.n, p.k, result[offsets[i]]);
+      } else {
+        fmt::println("  problem {} ({},{},{}) exact INT32", i, p.m, p.n, p.k);
+      }
+    }
+  }
+}
+
+template <int Bits>
+int run_cutlass_integer(CaseMode mode, const std::string& input) {
+  const bool check = mode == CaseMode::CHECK;
+  fmt::println("CUTLASS W{0}A{0}: standard GemmGrouped, INT{0} A/B, INT32 accumulate and store, no dequant", Bits);
+  fmt::println("tile 64x128x{}, warp 32x64x{}, mma 16x8x{}, stages 3, alignment {}",
+               1024 / Bits, 1024 / Bits, 256 / Bits, 128 / Bits);
+  if (check || input.empty()) {
+    run_cutlass_integer_group<Bits>("builtin",
+        {{1, 16, Bits == 8 ? 2048 : 64, Bits == 8}, {17, 32, 64, false}, {33, 16, 32, false},
+         {8, 16, Bits == 8 ? 32 : 64, false}, {64, 128, 128, false}}, mode);
+  }
+  if (input.empty()) return 0;
+
+  auto layers = parse_input_file(input);
+  int validated = 0, skipped = 0;
+  for (const auto& [case_name, groups] : layers) {
+    for (const auto& [group_name, shapes] : groups) {
+      std::vector<IntegerGemmProblem> problems;
+      long long flops = 0;
+      for (const auto& shape : shapes) {
+        if (shape.shape.size() != 3) throw ErrorInfo(fmt::format("{} shape is not M,N,K", shape));
+        if (shape.a_bits != Bits || shape.w_bits != Bits || !shape.sym || shape.gsize != -1) {
+          throw ErrorInfo(fmt::format("{}-{} is not symmetric W{}A{} gsize=-1: {}", case_name, group_name, Bits, Bits, shape));
+        }
+        problems.push_back({shape.shape[0], shape.shape[1], shape.shape[2], false});
+        flops += 2LL * shape.shape[0] * shape.shape[1] * shape.shape[2];
+      }
+      auto name = fmt::format("{}-{}", case_name, group_name);
+      if (check && flops > 20000000) {
+        std::cerr << fmt::format("{} exceeds the 20-million-operation host reference limit; this input is not validated.\n", name);
+        ++skipped;
+        continue;
+      }
+      run_cutlass_integer_group<Bits>(name, problems, mode);
+      ++validated;
+    }
+  }
+  if (check && (skipped > 0 || validated == 0)) {
+    std::cerr << fmt::format("input was not fully validated: validated={} skipped={}\n", validated, skipped);
+    return 1;
+  }
+  return 0;
+}
+
 }  // namespace utils
 
 int main(int argc, char* argv[]) {
@@ -954,7 +1102,11 @@ int main(int argc, char* argv[]) {
       .default_value(false)
       .implicit_value(true)
       .help("Enable verbose mode for extra logging");
-  program.add_argument("--input").required().help("Path to the input file");
+  program.add_argument("--backend")
+      .default_value("default"s)
+      .choices("default", "cutlass_w8a8", "cutlass_w4a4")
+      .help("default keeps the existing path; cutlass_w8a8 and cutlass_w4a4 run standard integer grouped GEMM");
+  program.add_argument("--input").default_value(""s).help("Path to the input file. Required for the default backend");
   program.add_argument("--output").default_value(""s).help("Path to the save the output");
   program.add_argument("--filter")
       .default_value(std::vector<std::string>())
@@ -975,6 +1127,14 @@ int main(int argc, char* argv[]) {
   auto case_mode = mode == "check" ? CaseMode::CHECK : CaseMode::BENCH;
   auto filter    = program.get<std::vector<std::string>>("--filter");
   fmt::println("filter: {}", filter);
+  auto backend   = program.get<std::string>("--backend");
+  if (backend == "cutlass_w8a8") return utils::run_cutlass_integer<8>(case_mode, workload);
+  if (backend == "cutlass_w4a4") return utils::run_cutlass_integer<4>(case_mode, workload);
+  if (workload.empty()) {
+    std::cerr << "--input is required unless --backend cutlass_w8a8 or cutlass_w4a4" << std::endl;
+    std::cerr << program;
+    return 1;
+  }
 
   using TA = half;
   using TB = half;
