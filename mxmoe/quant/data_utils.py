@@ -30,7 +30,7 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer:PreTrainedTokenizer, model_i
 
     testenc_cache = ID2CACHE["test"][model_id]
     if not os.path.exists(testenc_cache):
-        testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        testdata = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='test')
         testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')["input_ids"]
         os.makedirs(os.path.dirname(testenc_cache), exist_ok=True)
         with open(testenc_cache, "wb") as f:
@@ -45,7 +45,7 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer:PreTrainedTokenizer, model_i
 
     trainenc_cache = ID2CACHE["train"][model_id]
     if not os.path.exists(trainenc_cache):
-        traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        traindata = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='train')
         trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
         os.makedirs(os.path.dirname(trainenc_cache), exist_ok=True)
         with open(trainenc_cache, "wb") as f:

@@ -371,11 +371,10 @@ _DENSE_FFN_RE = re.compile(
 def dense_ffn_padding_kind(name: str, first_k: int) -> str | None:
     """Return how to pad one dense-MLP projection, or None if it is not one.
 
-    Routed experts and shared experts are excluded. Gate and up are padded on
-    their own output rows; they are never concatenated and padded at the end.
+    Matches only ``layers.{i}.mlp.{gate,up,down}_proj`` with ``i < first_k``.
+    Nested experts and merged gate_up names do not match. Gate and up are
+    padded on their own output rows, not as one concatenated matrix.
     """
-    if ".experts." in name or ".shared_experts." in name or "gate_up" in name:
-        return None
     match = _DENSE_FFN_RE.search(name)
     if match is None or int(match.group(1)) >= first_k:
         return None
@@ -880,7 +879,11 @@ def main(argv=None) -> None:
     print(f"[export] root={EXPORT_HF_ROOT}")
     print(f"[export] → {export_dir}")
 
-    device_map = "cpu" if args.model in ["qwen2_moe_57b", "mixtral"] or args.device_map == "cpu" else None
+    device_map = (
+        "cpu"
+        if args.model in ["qwen2_moe", "qwen2_moe_57b", "mixtral"] or args.device_map == "cpu"
+        else None
+    )
     model = load_hf_model(args.model, device_map=device_map)
 
     tokenizer = load_tokenizer(args.model)

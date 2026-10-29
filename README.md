@@ -89,14 +89,14 @@ We explore the automated design of mixed-precision quantization scheme for MoE m
 
 ### Uniform GPTQ checkpoints for vLLM
 
-This is separate from the mixed-precision GroupGEMM benchmark above. The
-`compressed_tensors` export preserves the GPTQ codes, FP32 scales, and zero
-points in the layout consumed by vLLM/Humming. `hf_float` still stores floating
-weights and does not select a low-bit inference kernel.
+This is separate from the mixed-precision GroupGEMM benchmark. The
+`compressed_tensors` export preserves GPTQ codes, FP32 scales, and raw zero
+points for vLLM/Humming; `hf_float` does not select a low-bit inference kernel.
+GPTQ runs in `mxmoe.quant.export_gptq_hf`, not vLLM. Defaults: WikiText2 **train**,
+128×4096 tokens, seed 42, damping 0.01, asymmetric weights, static groups.
 
-Use the shared CUDA 12.8 `mxmoe` environment from the environment guide. Model
-paths remain in `.env`; exported weights and measurement JSON stay under the
-gitignored output directories:
+Use the shared CUDA 12.8 `mxmoe` environment. Source model paths belong in
+`.env`; exports and measurement JSON belong in gitignored output directories.
 
 ```bash
 conda run --no-capture-output -n mxmoe python project_config.py --check ds2
@@ -110,26 +110,93 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
   --dtype half --trust-remote-code --output out/bench/ds2-w2a16-vllm.json
 ```
 
-The TP=1 padding changes only the exported dense FFN width from 10944 to 11008;
-the original checkpoint and expert width remain unchanged. Added quantized
-weights encode zero as `q == zero_point`. This format requires static groups and
-does not support Hadamard rotation, activation order, or partial-layer exports.
+For ds2, TP=1 padding changes only the exported dense FFN width, 10944→11008.
+Gate/up remain separate; added weights encode zero as `q == zero_point`.
+Source weights and expert width remain unchanged. This export does not support
+Hadamard, activation order, or partial-layer checkpoints.
 
-The runner uses a separate eager engine to observe real Humming calls, then an
-uninstrumented timing engine. It checks both dense MLP/shared-expert and routed
-expert W2A16 paths. Prefill, decode, TPOT, and TTFT are request-phase timings,
-not isolated CUDA kernel timings; JSON includes their exact boundaries. Prefix
-caching is disabled. Multi-request batches are enqueued behind a scheduler
-barrier so their prefill finishes together before decode. A successful export
-alone is not inference verification.
+Qwen1.5-MoE-A2.7B is `qwen2_moe`: 24 MoE layers, each with 60 routed experts
+(width 1408) and one shared MLP (width 5632). Both widths are group-128 aligned;
+no `--pad-dense-ffn` is needed. Export keeps the model on CPU and quantizes
+layers on the visible GPU. The runner derives shape checks from `config.json`;
+explicit `--expect-*-size` values override them, and 0 disables a check.
 
-For W2A4 on Ampere, reuse the same checkpoint and add `--activation-bits 4`
-with `--batch-size 1 --tensor-parallel-size 1`. Select one physical GPU per
-process with `CUDA_VISIBLE_DEVICES`; independent cases may run on separate
-GPUs. This mode enables dynamic per-token INT4 activations for the quantized
-MLPs, leaves attention in floating point, and forbids activation fallback.
-It uses one timing engine with a loaded-precision check, without the separate
-A16 observation pass. The checkpoint weights are not requantized or modified.
+```bash
+conda run --no-capture-output -n mxmoe python project_config.py --check qwen2_moe
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  python -m mxmoe.quant.export_gptq_hf --model qwen2_moe --wbits 2 --groupsize 128 \
+  --device-map cpu --export-format compressed_tensors \
+  --save outputs/qwen2_moe-gptq-w2-g128-asym-ct
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  python run_vllm_gptq.py outputs/qwen2_moe-gptq-w2-g128-asym-ct \
+  --dtype half --output out/bench/qwen2_moe-w2a16-vllm.json
+```
+
+For W4/W8 exports, set both export `--wbits` and runner `--weight-bits`.
+The A16 runner observes real Humming calls in a separate eager engine, then
+times an uninstrumented engine. Prefill/decode/TPOT/TTFT are request-phase
+intervals, not isolated CUDA kernel timings. Prefix caching is disabled;
+multi-request batches use a scheduler barrier. The W4/W8 Humming group-size
+fix is installed by `mxmoe/vllm_gptq_audit.py` before worker model loading,
+without modifying vLLM submodule sources or wrapping timed forward calls.
+
+For INT4/INT8 activations, reuse the checkpoint with `--activation-bits 4`
+or `8`, `--batch-size 1 --tensor-parallel-size 1`. This uses a loaded-precision
+check rather than the A16 observation pass; activation fallback is forbidden.
+Only quantized MLPs use dynamic per-token activations; attention stays floating.
+Humming rejects same-width integer weights with zero points, so the current
+asymmetric W4A4/W8A8 checkpoints cannot use those activation modes.
+
+#### Held-out quality
+
+`--quality-data` enables natural completions and teacher-forced PPL **after**
+timed repeats, on the same engine. The runner owns quality evaluation; no
+separate evaluation script is needed. Build input with the model's tokenizer:
+
+```bash
+conda run --no-capture-output -n mxmoe python - <<'PY'
+import json
+from pathlib import Path
+from project_config import check_model_paths
+from mxmoe.quant.data_utils import get_wikitext2
+from mxmoe.quant.moe_utils import load_tokenizer
+
+model_id, length = "ds2", 4096  # use qwen2_moe for Qwen
+assert check_model_paths([model_id])
+_, encoded = get_wikitext2(128, 42, length, load_tokenizer(model_id), model_id, test_only=True)
+tokens = encoded[0].tolist()
+data = {
+    "dataset": {"name": "Salesforce/wikitext", "split": "test",
+                "sequence_length": length, "dropped_tail_tokens": len(tokens) % length},
+    "prompts": ["The capital of France is", "人工智能是一种"],
+    "token_windows": [tokens[i:i + length] for i in range(0, len(tokens) - length + 1, length)],
+}
+path = Path(f"out/bench/{model_id}-quality-wikitext2.json")
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+PY
+```
+
+Append to the runner command:
+
+```bash
+--quality-data out/bench/ds2-quality-wikitext2.json \
+--quality-output-tokens 64 --max-model-len 4097
+```
+
+PPL is `exp(total NLL / predicted tokens)`, excluding each window's first token,
+not the mean of window PPLs. Missing/non-finite scores and rewritten/truncated
+inputs fail the run. The context must fit each window plus one token and each
+natural prompt plus its completion. JSON records counts, per-window NLL,
+aggregate PPL, and generated text; execution success is not a quality threshold.
+
+All regression checks live in `tests/test_vllm_gptq.py`: packing/quality logic
+runs on CPU; Humming initialization requires CUDA SM75+ and Humming, or is skipped.
+
+```bash
+conda run --no-capture-output -n mxmoe python -m pytest -q tests/test_vllm_gptq.py
+```
+
 
 ## 👀 Limitations
 

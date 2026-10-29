@@ -1,9 +1,9 @@
-"""Worker-side evidence that a compressed-tensors W2A16 model is really
+"""Worker-side evidence that a compressed-tensors WkA16 model is really
 running Humming for dense linears and routed experts.
 
-The timing process must not install these wrappers. ``GptqAuditExtension``
-only reads loaded modules. ``GptqAuditWorker`` installs the wrappers before
-weights are loaded, and only the eager observation engine uses that worker.
+The timing process must not install forward wrappers. Both workers install the
+compressed-tensors group-size fix at import, before model load; only the eager
+observation worker wraps forward calls.
 """
 
 from __future__ import annotations
@@ -329,7 +329,7 @@ def _role(prefix: str, module: Any) -> str:
     name = _leaf(prefix)
     class_name = type(module).__name__
     if class_name == "GateLinear" or (
-        name == "gate" and ".mlp." in prefix and "gate_proj" not in name
+        name in {"gate", "shared_expert_gate"} and ".mlp." in prefix
     ):
         return "router"
     if ".self_attn." in prefix:
@@ -342,16 +342,58 @@ def _role(prefix: str, module: Any) -> str:
         return "norm"
     if class_name == "RoutedExperts" or name == "experts":
         return "routed_experts"
-    if ".shared_experts." in prefix and name in _DENSE_PROJECTIONS:
-        return "shared_expert"
-    if (
-        ".experts." not in prefix
-        and ".shared_experts." not in prefix
-        and ".self_attn." not in prefix
-        and name in _DENSE_PROJECTIONS
-    ):
-        return "dense_mlp"
+    if name in _DENSE_PROJECTIONS:
+        if ".shared_experts." in prefix or ".shared_expert." in prefix:
+            return "shared_expert"
+        if ".experts." not in prefix:
+            return "dense_mlp"
     return "other"
+
+
+def mlp_layout(hf: Any) -> dict[str, Any]:
+    """Match vLLM's Qwen/DeepSeek decoder layout, including interleaved dense MLPs."""
+    num_layers = hf.num_hidden_layers
+    first_k = getattr(hf, "first_k_dense_replace", 0) or 0
+    freq = getattr(hf, "moe_layer_freq", 1) or 1
+    n_shared = getattr(hf, "n_shared_experts", None)
+    shared_width = getattr(hf, "shared_expert_intermediate_size", None)
+    if hf.model_type == "qwen2_moe":
+        mlp_only = set(getattr(hf, "mlp_only_layers", []) or [])
+        moe = [
+            i for i in range(num_layers)
+            if hf.num_experts > 0 and i not in mlp_only
+            and (i + 1) % hf.decoder_sparse_step == 0
+        ]
+        shared = bool(shared_width and shared_width > 0)
+    else:
+        moe = [
+            i for i in range(num_layers)
+            if getattr(hf, "n_routed_experts", None) is not None
+            and i >= first_k and i % freq == 0
+        ]
+        shared = bool(n_shared)
+    moe_set = set(moe)
+    return {
+        "model_type": hf.model_type,
+        "num_hidden_layers": num_layers,
+        "dense_layers": [i for i in range(num_layers) if i not in moe_set],
+        "moe_layers": moe,
+        "shared_expert_on_moe": shared,
+        "n_shared_experts": n_shared,
+        "shared_expert_intermediate_size": shared_width,
+        "first_k_dense_replace": first_k,
+        "moe_layer_freq": freq,
+    }
+
+
+def expected_humming_counts(layout: dict[str, Any]) -> dict[str, int]:
+    """gate_up + down for each dense MLP and each shared-expert MLP."""
+    n_moe = len(layout["moe_layers"])
+    n_shared_mlps = n_moe if layout["shared_expert_on_moe"] else 0
+    return {
+        "HummingLinearMethod": 2 * (len(layout["dense_layers"]) + n_shared_mlps),
+        "HummingMoEMethod": n_moe,
+    }
 
 
 def _method(module: Any) -> Any:
@@ -488,10 +530,6 @@ def _moe_record(prefix: str, module: Any) -> dict[str, Any]:
     }
 
 
-def _is_moe_layer(layer_idx: int, first_k: int, moe_freq: int) -> bool:
-    return layer_idx >= first_k and layer_idx % moe_freq == 0
-
-
 def _projection_gap(names: set[str]) -> str | None:
     has_down = "down_proj" in names
     has_up = "gate_up_proj" in names or {"gate_proj", "up_proj"} <= names
@@ -531,7 +569,7 @@ def _check_w2_linear(
     if record["static_selection"] == "unquantized" or record["floating_weights"]:
         failures.append(
             f"{prefix} is floating ({record['quant_method']}, "
-            f"weights {record['floating_weights'] or 'unquantized'}); expected Humming W2A16"
+            f"weights {record['floating_weights'] or 'unquantized'}); expected Humming W{weight_bits}A16"
         )
         return
     if record["kernel"] != "HummingLinearKernel":
@@ -548,7 +586,7 @@ def _check_w2_linear(
             f"{prefix} group size is {record['group_size']}, expected {group_size}"
         )
     if record["symmetric"] is None or bool(record["symmetric"]):
-        failures.append(f"{prefix} symmetric={record['symmetric']}, expected asymmetric W2")
+        failures.append(f"{prefix} symmetric={record['symmetric']}, expected asymmetric W{weight_bits}")
     if not _is_a16_dtype(record["activation_dtype"]):
         failures.append(
             f"{prefix} activation dtype is {record['activation_dtype']}, "
@@ -569,7 +607,7 @@ def _check_w2_moe(
     }:
         failures.append(
             f"{prefix} routed experts are floating ({record['quant_method']}, "
-            f"weights {record['floating_weights'] or 'missing'}); expected Humming W2A16"
+            f"weights {record['floating_weights'] or 'missing'}); expected Humming W{weight_bits}A16"
         )
         return
     if record["moe_backend"] != "HUMMING":
@@ -590,7 +628,7 @@ def _check_w2_moe(
             f"{prefix} group size is {record['group_size']}, expected {group_size}"
         )
     if record["symmetric"] is None or bool(record["symmetric"]):
-        failures.append(f"{prefix} symmetric={record['symmetric']}, expected asymmetric W2")
+        failures.append(f"{prefix} symmetric={record['symmetric']}, expected asymmetric W{weight_bits}")
     if not _is_a16_dtype(record["activation_dtype"]):
         failures.append(
             f"{prefix} configured activation dtype is {record['activation_dtype']}, expected A16"
@@ -609,10 +647,10 @@ def inspect_loaded_model(
     """Classify loaded modules. This is static selection, not an observed call."""
     model = worker.model_runner.model
     hf = worker.vllm_config.model_config.hf_config
-    first_k = int(getattr(hf, "first_k_dense_replace", 0) or 0)
-    moe_freq = int(getattr(hf, "moe_layer_freq", 1) or 1)
-    num_layers = int(getattr(hf, "num_hidden_layers"))
-    n_shared = getattr(hf, "n_shared_experts", None)
+    layout = mlp_layout(hf)
+    dense_layers = set(layout["dense_layers"])
+    moe_layers = set(layout["moe_layers"])
+    shared_on_moe = bool(layout["shared_expert_on_moe"])
     failures: list[str] = []
     notes: list[str] = []
     required: list[dict[str, Any]] = []
@@ -631,26 +669,19 @@ def inspect_loaded_model(
                 excluded_quantized.append(f"{named_prefix}: {type(method).__name__}")
             continue
         layer_idx = _layer_index(named_prefix)
-        if role == "dense_mlp":
-            if layer_idx is None or layer_idx >= first_k:
+        if role in {"dense_mlp", "shared_expert"}:
+            allowed_layers = dense_layers if role == "dense_mlp" else moe_layers
+            if layer_idx not in allowed_layers or (role == "shared_expert" and not shared_on_moe):
                 continue
             prefix = _canonical_prefix(named_prefix, module)
             module._gptq_audit_prefix = prefix
             record = _linear_record(prefix, module, role)
             required.append(record)
-            dense_names.setdefault(layer_idx, set()).add(_leaf(prefix))
-            _check_w2_linear(record, weight_bits, group_size, failures)
-        elif role == "shared_expert":
-            if layer_idx is None or not _is_moe_layer(layer_idx, first_k, moe_freq):
-                continue
-            prefix = _canonical_prefix(named_prefix, module)
-            module._gptq_audit_prefix = prefix
-            record = _linear_record(prefix, module, role)
-            required.append(record)
-            shared_names.setdefault(layer_idx, set()).add(_leaf(prefix))
+            names = dense_names if role == "dense_mlp" else shared_names
+            names.setdefault(layer_idx, set()).add(_leaf(prefix))
             _check_w2_linear(record, weight_bits, group_size, failures)
         elif role == "routed_experts" and type(module).__name__ == "RoutedExperts":
-            if layer_idx is None or not _is_moe_layer(layer_idx, first_k, moe_freq):
+            if layer_idx is None or layer_idx not in moe_layers:
                 continue
             prefix = _canonical_prefix(named_prefix, module)
             record = _moe_record(prefix, module)
@@ -659,24 +690,22 @@ def inspect_loaded_model(
             _stamp_moe_prefix(module, prefix)
             _check_w2_moe(record, weight_bits, group_size, failures)
 
-    for layer_idx in range(first_k):
+    for layer_idx in layout["dense_layers"]:
         gap = _projection_gap(dense_names.get(layer_idx, set()))
         if gap is not None:
             failures.append(
-                f"layer {layer_idx} dense MLP is missing a W2 projection ({gap})"
+                f"layer {layer_idx} dense MLP is missing a W{weight_bits} projection ({gap})"
             )
-    for layer_idx in range(first_k, num_layers):
-        if not _is_moe_layer(layer_idx, first_k, moe_freq):
-            continue
+    for layer_idx in layout["moe_layers"]:
         if layer_idx not in expert_layers:
             failures.append(
                 f"layer {layer_idx} routed experts were not loaded as quantized experts"
             )
-        if n_shared:
+        if shared_on_moe:
             gap = _projection_gap(shared_names.get(layer_idx, set()))
             if gap is not None:
                 failures.append(
-                    f"layer {layer_idx} shared experts are missing a W2 projection ({gap})"
+                    f"layer {layer_idx} shared experts are missing a W{weight_bits} projection ({gap})"
                 )
 
     if excluded_quantized:
@@ -712,10 +741,8 @@ def inspect_loaded_model(
     _RECORDER.required_moe_prefixes = moe_prefixes
     return {
         "engine": engine,
-        "first_k_dense_replace": first_k,
-        "moe_layer_freq": moe_freq,
-        "num_hidden_layers": num_layers,
-        "n_shared_experts": n_shared,
+        **layout,
+        "expected_humming_counts": expected_humming_counts(layout),
         "required_modules": required,
         "excluded_counts": excluded_counts,
         "required_dense_prefixes": dense_prefixes,
@@ -769,10 +796,11 @@ def _observed_failures() -> list[str]:
     return failures
 
 
-def inspect_humming_a4(worker) -> dict:
+def inspect_humming_a4(worker, weight_bits: int = 2, activation_bits: int = 4) -> dict:
     """Read actual loaded kernel configurations; do not add forward hooks."""
     records, failures = [], []
     counts = {"HummingLinearMethod": 0, "HummingMoEMethod": 0}
+    label = f"W{weight_bits}A{activation_bits}"
     for prefix, layer in worker.model_runner.model.named_modules():
         leaf = prefix.rsplit(".", 1)[-1]
         if ".mlp." not in prefix or not (
@@ -801,15 +829,15 @@ def inspect_humming_a4(worker) -> dict:
                       "input_quant_mode": str(cfg.input_quant_mode.value),
                       "weight_group_size": cfg.weight_scale_group_size}
             records.append(record)
-            if (record["weight_bits"], record["activation_bits"]) != (2, 4):
-                failures.append(f"{prefix}.{part} is not W2A4: {record}")
+            if (record["weight_bits"], record["activation_bits"]) != (weight_bits, activation_bits):
+                failures.append(f"{prefix}.{part} is not {label}: {record}")
     hf = worker.vllm_config.model_config.hf_config
-    first = int(getattr(hf, "first_k_dense_replace", 0))
-    moe = sum(i >= first and i % getattr(hf, "moe_layer_freq", 1) == 0
-              for i in range(hf.num_hidden_layers))
-    dense = 2 * (hf.num_hidden_layers - moe + (moe if getattr(hf, "n_shared_experts", 0) else 0))
-    if counts != {"HummingLinearMethod": dense, "HummingMoEMethod": moe}:
-        failures.append(f"Incomplete W2A4 module coverage: {counts}")
+    layout = mlp_layout(hf)
+    expected = expected_humming_counts(layout)
+    if counts != expected:
+        failures.append(
+            f"Incomplete {label} module coverage: {counts}, expected {expected}"
+        )
     tp = worker.vllm_config.parallel_config.tensor_parallel_size
     if tp != 1:
         failures.append(f"Expected single-GPU execution, got TP={tp}")
@@ -823,8 +851,10 @@ class GptqAuditExtension:
     def gptq_audit_inspect(self, weight_bits: int = 2, group_size: int = 128) -> dict:
         return inspect_loaded_model(self, weight_bits=weight_bits, group_size=group_size)
 
-    def gptq_audit_inspect_a4(self) -> dict:
-        return inspect_humming_a4(self)
+    def gptq_audit_inspect_a4(self, weight_bits: int = 2, activation_bits: int = 4) -> dict:
+        return inspect_humming_a4(
+            self, weight_bits=weight_bits, activation_bits=activation_bits
+        )
 
     def gptq_audit_begin(self, batch_size: int, prompt_len: int) -> dict:
         install_backend_counters()
@@ -869,6 +899,43 @@ class GptqAuditExtension:
     def gptq_audit_uninstall(self) -> dict:
         uninstall_backend_counters()
         return {"installed": _RECORDER.installed}
+
+
+def _install_humming_group_scale() -> None:
+    """Keep CT's W4/W8 group-size sentinel out of Humming, without editing vLLM."""
+    from dataclasses import replace
+    from functools import wraps
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        compressed_tensors_moe_wna16 as ct,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+
+    original = ct.select_wna16_moe_backend
+    if getattr(original, "_mxmoe_group_scale", False):
+        return
+
+    @wraps(original)
+    def select(config, weight_key, quant_config, *args, **kwargs):
+        group_size = quant_config.group_size
+        if (
+            config.moe_backend == "humming"
+            and quant_config.num_bits in (4, 8)
+            and group_size is not None and group_size > 0
+            and weight_key.scale.group_shape == GroupShape(1, -1)
+        ):
+            weight_key = replace(
+                weight_key,
+                scale=replace(weight_key.scale, group_shape=GroupShape(1, group_size)),
+            )
+        return original(config, weight_key, quant_config, *args, **kwargs)
+
+    select._mxmoe_group_scale = True
+    ct.select_wna16_moe_backend = select
+
+
+# worker_extension_cls is imported in each worker before model construction.
+_install_humming_group_scale()
 
 
 def _gpu_worker():

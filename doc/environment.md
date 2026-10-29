@@ -207,6 +207,10 @@ print('ENV_IMPORT_PASS', torch.__version__, transformers.__version__, vllm.__ver
 PY
 ```
 
+vLLM 的 FlashInfer RoPE/sampling 可能在运行时 JIT 编译。实际执行 `LLM.generate`
+时仍须使用上述 CUDA 12.8 工具链，确保 `nvcc`、`CUDA_HOME`、开发头文件
+（含 `curand.h`）及链接库一致；扩展安装或导入成功不能替代运行时验证。
+
 ### 小规模 CUDA 数值 smoke（不加载模型、不测性能）
 
 先用 `nvidia-smi` 确认 GPU 余量，在 shell 设置 `MXMOE_TEST_GPU` 为选定的物理 GPU 编号；不要抢占他人的推理/训练显存。

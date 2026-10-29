@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Validate and time a padded DeepSeek-V2-Lite W2 GPTQ checkpoint in vLLM.
+"""Validate and time a uniform GPTQ compressed-tensors checkpoint in vLLM.
 
-The checkpoint is compressed-tensors pack-quantized, weight-only (A16), group
-size 128, asymmetric. This script forces Humming for dense W2 linears and
-routed experts, disables prefix caching, and keeps tensor parallel size 1
-unless overridden.
+Supported checkpoints are padded DeepSeek-V2-Lite and Qwen1.5-MoE-A2.7B
+(``qwen2_moe``). The checkpoint is weight-only (A16), group size 128,
+asymmetric. Supported weight widths are 2, 4, and 8. This script
+forces Humming for the quantized dense linears, shared experts, and routed
+experts, disables prefix caching, and keeps tensor parallel size 1 unless
+overridden.
 
-``--activation-bits 4`` reuses the same packed weights, applies dynamic
-per-token INT4 activation quantization through Humming, and disables fallback.
-It uses one timing engine and checks its loaded precision configuration,
-without running the separate A16-only observation pass.
+``--activation-bits 4`` or ``8`` reuses the same packed weights, applies dynamic
+per-token INT4 or INT8 activation quantization through Humming, and disables
+fallback. It uses one timing engine and checks its loaded precision
+configuration, without running the separate A16-only observation pass.
 
 The default A16 mode loads two engines:
 
@@ -40,10 +42,17 @@ launch durations:
   submission and detokenization. Batches are enqueued behind a scheduler
   barrier before execution; single requests use ``LLM.generate``.
 
+Optional ``--quality-data`` scores held-out token windows and greedily
+completes natural prompts on this same uninstrumented timing engine, after
+the measured repeats. Omit it to keep the default benchmark unchanged.
+
 Example:
     python run_vllm_gptq.py /path/to/padded-ds2-w2a16 \\
         --prompt-len 512 --batch-size 1 --output-tokens 128 \\
         --warmup 1 --repeats 3 --output /tmp/vllm_w2a16.json
+    python run_vllm_gptq.py /path/to/padded-ds2-w2a16 \\
+        --quality-data /path/to/quality.json --quality-output-tokens 64 \\
+        --max-model-len 4097 --prompt-len 512 --output-tokens 128
 """
 
 from __future__ import annotations
@@ -55,6 +64,7 @@ import os
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 
@@ -97,7 +107,7 @@ TIMING_BOUNDARIES = {
 LIMITATIONS = [
     "prefill_s, decode_s, tpot_s, and ttft_s are engine request-phase intervals, not kernel latencies.",
     "ttft_s includes queue time and IPC. prefill_s does not. Do not treat them as the same quantity.",
-    "Timed decode may use CUDA graph replay. The default A16 mode records calls in a separate eager engine; A4 uses a loaded-kernel precision check with fallback disabled and no extra observation engine.",
+    "Timed decode may use CUDA graph replay. The default A16 mode records calls in a separate eager engine; A4 and A8 use a loaded-kernel precision check with fallback disabled and no extra observation engine.",
     "Requests that share a scheduler step share engine timestamps. Per-request intervals are batch-step intervals, not isolated single-sequence kernel times.",
     "Batches are submitted behind a scheduler barrier so later prompts cannot overlap earlier requests' decode. TTFT and wall time include submission/barrier overhead.",
     "A non-zero prefix-cache hit or preemption fails the run because it changes the interval meaning.",
@@ -126,29 +136,39 @@ def parse_args() -> argparse.Namespace:
         "--max-model-len",
         type=int,
         default=0,
-        help="0 uses prompt length plus the longest generated length.",
+        help=(
+            "0 uses the benchmark prompt plus the longest generated length, "
+            "and also the quality window and completion lengths when "
+            "--quality-data is set."
+        ),
     )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--weight-bits", type=int, default=2)
     parser.add_argument("--group-size", type=int, default=128)
-    parser.add_argument("--activation-bits", type=int, choices=[4, 16], default=16)
+    parser.add_argument("--activation-bits", type=int, choices=[4, 8, 16], default=16)
     parser.add_argument(
         "--quantization",
         default="compressed-tensors",
-        help="vLLM quantization method. W2 uses compressed-tensors, not gptq.",
+        help="vLLM quantization method. A16 uses compressed-tensors, not gptq.",
     )
     parser.add_argument(
         "--expect-intermediate-size",
         type=int,
-        default=11008,
-        help="Dense MLP width after the layer-0 pad. 0 disables the check.",
+        default=None,
+        help=(
+            "Dense MLP width the loaded config must match. Omit to read "
+            "checkpoint config.json. A positive value overrides. 0 disables the check."
+        ),
     )
     parser.add_argument(
         "--expect-moe-intermediate-size",
         type=int,
-        default=1408,
-        help="Unpadded expert width. 0 disables the check.",
+        default=None,
+        help=(
+            "Expert width the loaded config must match. Omit to read "
+            "checkpoint config.json. A positive value overrides. 0 disables the check."
+        ),
     )
     parser.add_argument(
         "--enforce-eager",
@@ -156,8 +176,22 @@ def parse_args() -> argparse.Namespace:
         help="Time without CUDA graphs. Default leaves vLLM graph capture on.",
     )
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--quality-data",
+        default=None,
+        help=(
+            "Optional JSON file with dataset metadata, natural completion "
+            "prompts, and held-out token windows. Omit to keep the default benchmark."
+        ),
+    )
+    parser.add_argument(
+        "--quality-output-tokens",
+        type=int,
+        default=64,
+        help="Greedy completion length for each natural prompt. Default 64.",
+    )
     args = parser.parse_args()
-    if args.activation_bits == 4:
+    if args.activation_bits in (4, 8):
         args.quantization = "humming"
     if args.prompt_len < 2:
         parser.error("--prompt-len must be at least 2 so prefill and decode differ")
@@ -169,8 +203,21 @@ def parse_args() -> argparse.Namespace:
         parser.error("--observation-output-tokens must be at least 2 to include decode")
     if args.smoke_output_tokens < 1:
         parser.error("--smoke-output-tokens must be positive")
+    if args.quality_output_tokens < 1:
+        parser.error("--quality-output-tokens must be positive")
+    if (
+        args.quality_data is not None
+        and args.activation_bits in (4, 8)
+        and (args.batch_size != 1 or args.tensor_parallel_size != 1)
+    ):
+        parser.error(
+            f"--activation-bits {args.activation_bits} with --quality-data requires "
+            "--batch-size 1 and --tensor-parallel-size 1"
+        )
     if not Path(args.model).is_dir():
         parser.error(f"model path is not a directory: {args.model}")
+    if args.quality_data is not None and not Path(args.quality_data).is_file():
+        parser.error(f"quality data file does not exist: {args.quality_data}")
     return args
 
 
@@ -227,18 +274,21 @@ def hf_snapshot(llm) -> dict:
     config = llm.llm_engine.model_config.hf_config
     names = (
         "architectures",
+        "model_type",
         "hidden_size",
         "intermediate_size",
         "moe_intermediate_size",
+        "shared_expert_intermediate_size",
         "first_k_dense_replace",
+        "decoder_sparse_step",
         "num_hidden_layers",
         "n_routed_experts",
         "n_shared_experts",
+        "num_experts",
+        "num_experts_per_tok",
         "torch_dtype",
-        "model_type",
     )
     return {name: json_ready(config_value(config, name)) for name in names}
-
 
 def shape_failures(llm, args) -> list[str]:
     snapshot = hf_snapshot(llm)
@@ -259,20 +309,61 @@ def shape_failures(llm, args) -> list[str]:
     return failures
 
 
+def resolve_shape_expectations(
+    model_dir: str, intermediate: int | None, moe: int | None
+) -> tuple[int | None, int | None, list[str]]:
+    """None reads checkpoint config. A positive value overrides. 0 disables.
+
+    A missing auto field stays None and is a failure, not a disable.
+    """
+    if intermediate is not None and moe is not None:
+        return intermediate, moe, []
+    path = Path(model_dir) / "config.json"
+    if not path.is_file():
+        return intermediate, moe, [f"checkpoint config.json is missing: {path}"]
+    cfg = json.loads(path.read_text())
+    failures: list[str] = []
+    resolved = []
+    for name, given in (("intermediate_size", intermediate), ("moe_intermediate_size", moe)):
+        if given is not None:
+            resolved.append(given)
+            continue
+        raw = cfg.get(name)
+        if type(raw) is int and raw > 0:
+            resolved.append(raw)
+        else:
+            failures.append(f"checkpoint config.json {name} is missing or not a positive integer")
+            resolved.append(None)
+    return resolved[0], resolved[1], failures
+
+
+def apply_shape_expectations(args) -> list[str]:
+    intermediate, moe, failures = resolve_shape_expectations(
+        args.model,
+        args.expect_intermediate_size,
+        args.expect_moe_intermediate_size,
+    )
+    args.expect_intermediate_size = intermediate
+    args.expect_moe_intermediate_size = moe
+    return failures
+
+
 def engine_lengths(args) -> tuple[int, int]:
     longest_output = max(
         args.output_tokens,
         args.observation_output_tokens,
         args.smoke_output_tokens,
     )
-    max_model_len = args.max_model_len or (args.prompt_len + longest_output)
+    benchmark = args.prompt_len + longest_output
+    quality_need = int(getattr(args, "quality_required_len", 0) or 0)
+    needed = max(benchmark, quality_need)
+    max_model_len = args.max_model_len or needed
     max_batched = max(args.batch_size * args.prompt_len, max_model_len)
     return max_model_len, max_batched
 
 
 def build_llm(args, *, enforce_eager: bool, worker_cls: str | None, worker_extension_cls: str | None):
     from vllm import LLM
-
     max_model_len, max_batched = engine_lengths(args)
     kwargs = {
         "model": args.model,
@@ -291,7 +382,7 @@ def build_llm(args, *, enforce_eager: bool, worker_cls: str | None, worker_exten
         "max_num_seqs": args.batch_size,
         "trust_remote_code": args.trust_remote_code,
     }
-    if args.activation_bits == 4:
+    if args.activation_bits in (4, 8):
         quant_config = json.loads((Path(args.model) / "config.json").read_text())["quantization_config"]
         # Humming's CT adapter selects the Linear target, not projection regexes.
         # Retain the checkpoint's explicit attention/router/embedding exclusions.
@@ -522,7 +613,7 @@ def sample_from(record: dict | None) -> dict | None:
 
 def new_report(args) -> dict:
     max_model_len, max_batched = engine_lengths(args)
-    return {
+    report = {
         "ok": False,
         "schema_version": 2,
         "model": args.model,
@@ -542,19 +633,32 @@ def new_report(args) -> dict:
             "tensor_parallel_size": args.tensor_parallel_size,
             "enable_prefix_caching": False,
             "batch_submission": "scheduler_barrier" if args.batch_size > 1 else "generate",
+            "expect_intermediate_size": args.expect_intermediate_size,
+            "expect_moe_intermediate_size": args.expect_moe_intermediate_size,
             "weight_bits": args.weight_bits,
             "group_size": args.group_size,
             "asymmetric": True,
             "activation": f"A{args.activation_bits}",
             "enforce_eager_timing": args.enforce_eager,
-            "input_quantization": {"dtype": "int4", "group_size": 0, "allow_fallback": False}
-            if args.activation_bits == 4 else None,
+            "input_quantization": {
+                "dtype": f"int{args.activation_bits}",
+                "group_size": 0,
+                "allow_fallback": False,
+            }
+            if args.activation_bits in (4, 8) else None,
             "max_model_len": max_model_len,
             "max_num_batched_tokens": max_batched,
             "max_num_seqs": args.batch_size,
         },
         "failures": [],
     }
+    if getattr(args, "quality_data", None):
+        report["requested"]["quality_data"] = args.quality_data
+        report["requested"]["quality_output_tokens"] = args.quality_output_tokens
+        required = getattr(args, "quality_required_len", None)
+        if required:
+            report["requested"]["quality_required_max_model_len"] = required
+    return report
 
 
 def observe(args, report: dict) -> tuple[int, str] | None:
@@ -638,9 +742,14 @@ def time_engine(args, report: dict, token_id: int | None) -> None:
     )
     report["timing_llm_kwargs"] = dict(kwargs)
     try:
-        report["failures"].extend(shape_failures(llm, args))
-        if args.activation_bits == 4:
-            static_reports = rpc_all(llm, "gptq_audit_inspect_a4")
+        shape_errors = shape_failures(llm, args)
+        report["failures"].extend(shape_errors)
+        if args.activation_bits in (4, 8):
+            static_reports = rpc_all(
+                llm, "gptq_audit_inspect_a4",
+                weight_bits=args.weight_bits,
+                activation_bits=args.activation_bits,
+            )
         else:
             static_reports = rpc_all(
                 llm, "gptq_audit_inspect", weight_bits=args.weight_bits,
@@ -649,8 +758,20 @@ def time_engine(args, report: dict, token_id: int | None) -> None:
         report["static_selection_timing"] = static_reports
         static_failures = merged_failures(static_reports)
         report["failures"].extend(static_failures)
-        if static_failures:
-            report["timing_skipped"] = f"timing engine did not select the Humming W2A{args.activation_bits} path"
+        if shape_errors or static_failures:
+            if shape_errors and static_failures:
+                reason = (
+                    "loaded config shape does not match expectations; "
+                    f"timing engine did not select the Humming W{args.weight_bits}A{args.activation_bits} path"
+                )
+            elif shape_errors:
+                reason = "loaded config shape does not match expectations"
+            else:
+                reason = (
+                    f"timing engine did not select the Humming W{args.weight_bits}A{args.activation_bits} path"
+                )
+            report["timing_skipped"] = reason
+            _quality_skipped(args, report, "quality evaluation was not run because " + reason)
             return
         if token_id is None:
             token_id, token_source = choose_token_id(llm.get_tokenizer())
@@ -723,6 +844,7 @@ def time_engine(args, report: dict, token_id: int | None) -> None:
                 [record for item in repeats for record in item["requests"]]
             ),
         }
+        _record_quality(args, report, llm)
     finally:
         shutdown_llm(llm)
 
@@ -746,17 +868,423 @@ def _median_defined(values: list[float | None]) -> float | None:
     return float(median(found))
 
 
+class QualityDataError(ValueError):
+    """Quality input or score is unusable. The message is safe for the JSON report."""
+
+
+@dataclass(frozen=True)
+class QualityData:
+    dataset: dict
+    prompts: list[str]
+    token_windows: list[list[int]]
+    source: str
+
+
+_QUALITY_PROTOCOL = {
+    "name": "held-out window perplexity",
+    "scoring": "prompt_logprobs=0, max_tokens=1, temperature=0, ignore_eos; one window per request",
+    "scored_positions": "1..len(window)-1",
+    "excluded_positions": "window index 0 only",
+    "nll": "-log p(target | preceding window tokens)",
+    "aggregation": "exp(sum(NLL) / predicted tokens), weighted by predicted-token count",
+    "generation": "greedy temperature=0, max_tokens=output_tokens; one raw completion per prompt",
+    "prompt_encoding": "tokenizer.encode(text, add_special_tokens=True)",
+    "separated_from_benchmark_timing": True,
+}
+_QUALITY_LIMITATION = (
+    "Held-out window perplexity from teacher-forced prompt logprobs. "
+    "Each window's first token is excluded. Not a paper reproduction. "
+    "Finite logprobs are an integrity check, not a quality threshold."
+)
+
+
+def load_quality_data(path: str | Path) -> QualityData:
+    """Load and validate the quality JSON contract. Keeps the parsed lists."""
+    source = str(path)
+    file = Path(path)
+    if not file.is_file():
+        raise QualityDataError(f"quality data file does not exist: {source}")
+    try:
+        payload = json.loads(file.read_text())
+    except json.JSONDecodeError as exc:
+        raise QualityDataError(f"quality data is not valid JSON: {source}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise QualityDataError(f"quality data must be a JSON object: {source}")
+    dataset = payload.get("dataset")
+    prompts = payload.get("prompts")
+    windows = payload.get("token_windows")
+    if not isinstance(dataset, dict):
+        raise QualityDataError(f"{source} dataset must be an object")
+    for name in ("name", "split"):
+        if not isinstance(dataset.get(name), str) or not dataset.get(name):
+            raise QualityDataError(f"{source} dataset.{name} must be a non-empty string")
+    length = dataset.get("sequence_length")
+    if type(length) is not int or length < 2:
+        raise QualityDataError(f"{source} dataset.sequence_length must be an integer >= 2")
+    if not isinstance(prompts, list) or not prompts:
+        raise QualityDataError(f"{source} prompts must be a non-empty list")
+    for index, text in enumerate(prompts):
+        if not isinstance(text, str) or text == "":
+            raise QualityDataError(f"{source} prompts[{index}] must be a non-empty string")
+    if not isinstance(windows, list) or not windows:
+        raise QualityDataError(f"{source} token_windows must be a non-empty list")
+    declared = dataset.get("windows")
+    if declared is not None and declared != len(windows):
+        raise QualityDataError(
+            f"{source} dataset.windows is {declared}, but token_windows has {len(windows)}"
+        )
+    for index, window in enumerate(windows):
+        where = f"{source} token_windows[{index}]"
+        if not isinstance(window, list):
+            raise QualityDataError(f"{where} must be a list")
+        if len(window) != length:
+            raise QualityDataError(
+                f"{where} has {len(window)} tokens, expected sequence_length {length}"
+            )
+        for token in window:
+            if type(token) is not int:
+                raise QualityDataError(f"{where} is not an integer token id")
+            if token < 0:
+                raise QualityDataError(f"{where} is negative")
+    return QualityData(dataset, prompts, windows, source)
+
+
+def _exp_ppl(mean_nll: float, where: str) -> float:
+    if not math.isfinite(mean_nll):
+        raise QualityDataError(f"{where} is non-finite")
+    try:
+        ppl = math.exp(mean_nll)
+    except OverflowError as exc:
+        raise QualityDataError(f"{where} is non-finite") from exc
+    if not math.isfinite(ppl):
+        raise QualityDataError(f"{where} is non-finite")
+    return ppl
+
+
+def score_window_logprobs(
+    token_ids: list[int],
+    prompt_logprobs,
+    *,
+    index: int = 0,
+) -> dict[str, float | int]:
+    """NLL for positions 1..len-1. Fail on missing, truncated, or non-finite data."""
+    if len(token_ids) < 2:
+        raise QualityDataError(
+            f"window {index} has {len(token_ids)} tokens; at least 2 are required"
+        )
+    if prompt_logprobs is None:
+        raise QualityDataError(
+            f"window {index} prompt logprobs are missing; refusing to skip this window"
+        )
+    try:
+        covered = len(prompt_logprobs)
+    except TypeError as exc:
+        raise QualityDataError(f"window {index} prompt logprobs are not a sequence") from exc
+    if covered != len(token_ids):
+        raise QualityDataError(
+            f"window {index} prompt logprobs cover {covered} positions, "
+            f"expected {len(token_ids)}; refusing to score a truncated window"
+        )
+    nlls = []
+    for position in range(1, len(token_ids)):
+        where = f"window {index} position {position}"
+        token_id = token_ids[position]
+        entry = prompt_logprobs[position]
+        if not isinstance(entry, dict) or not entry:
+            raise QualityDataError(
+                f"{where} is missing prompt logprobs for target token {token_id}"
+            )
+        if token_id not in entry:
+            raise QualityDataError(
+                f"{where} is missing target token {token_id}; prompt logprob keys are {list(entry)}"
+            )
+        value = entry[token_id]
+        number = value if type(value) in (int, float) else getattr(value, "logprob", None)
+        if type(number) not in (int, float) or not math.isfinite(number):
+            raise QualityDataError(f"{where} logprob for target token {token_id} is non-finite")
+        nlls.append(-float(number))
+    nll_sum = math.fsum(nlls)
+    if not math.isfinite(nll_sum):
+        raise QualityDataError(f"window {index} NLL sum is non-finite")
+    predicted = len(token_ids) - 1
+    mean_nll = nll_sum / predicted
+    return {
+        "index": index,
+        "tokens": len(token_ids),
+        "predicted_tokens": predicted,
+        "nll_sum": nll_sum,
+        "mean_nll": mean_nll,
+        "ppl": _exp_ppl(mean_nll, f"window {index} perplexity"),
+    }
+
+
+def aggregate_window_nlls(windows: list[dict]) -> dict[str, float | int]:
+    """Weight each window by its predicted-token count. Do not average PPLs."""
+    if not windows:
+        raise QualityDataError("no windows to aggregate")
+    predicted = 0
+    nll_sum = 0.0
+    for window in windows:
+        count = window.get("predicted_tokens")
+        total = window.get("nll_sum")
+        index = window.get("index", "?")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise QualityDataError(
+                f"window {index} predicted token count is {count!r}, expected a positive integer"
+            )
+        if (
+            isinstance(total, bool)
+            or not isinstance(total, (int, float))
+            or not math.isfinite(float(total))
+        ):
+            raise QualityDataError(f"window {index} NLL sum is non-finite")
+        predicted += count
+        nll_sum += float(total)
+    mean_nll = nll_sum / predicted
+    return {
+        "nll_sum": nll_sum,
+        "predicted_tokens": predicted,
+        "mean_nll": mean_nll,
+        "ppl": _exp_ppl(mean_nll, "held-out window perplexity"),
+    }
+
+
+def length_failure(
+    max_model_len: int,
+    *,
+    window_tokens: int,
+    prompt_tokens: int,
+    output_tokens: int,
+) -> str | None:
+    """Return a refusal message when an explicit context length would truncate."""
+    if isinstance(max_model_len, bool) or not isinstance(max_model_len, int) or max_model_len < 1:
+        return (
+            f"max_model_len must be a positive integer to score quality data, "
+            f"got {max_model_len!r}. Refusing to truncate."
+        )
+    window_need = window_tokens + 1
+    prompt_need = prompt_tokens + output_tokens
+    need = max(window_need, prompt_need)
+    if max_model_len >= need:
+        return None
+    return (
+        f"max_model_len {max_model_len} is smaller than {need}: "
+        f"largest token window is {window_tokens} and teacher-forced scoring "
+        f"generates 1 token (need {window_need}); longest natural prompt is "
+        f"{prompt_tokens} tokens and quality generation requests {output_tokens} "
+        f"tokens (need {prompt_need}). Refusing to truncate."
+    )
+
+
+def _encode_prompts(tokenizer, prompts: list[str]) -> list[list[int]]:
+    encoded = []
+    for index, text in enumerate(prompts):
+        ids = tokenizer.encode(text, add_special_tokens=True)
+        if not ids:
+            raise QualityDataError(f"prompts[{index}] encodes to no tokens")
+        encoded.append(ids)
+    return encoded
+
+
+def _require_echo(output, expected, where: str) -> None:
+    echoed = output.prompt_token_ids
+    if (
+        echoed is None
+        or len(echoed) != len(expected)
+        or any(got != want for got, want in zip(echoed, expected))
+    ):
+        got = 0 if echoed is None else len(echoed)
+        raise QualityDataError(
+            f"{where} prompt was truncated or rewritten "
+            f"({got} tokens returned, {len(expected)} submitted); refusing to score"
+        )
+
+
+def _one_output(llm, prompt: dict, params):
+    outputs = llm.generate([prompt], params, use_tqdm=False)
+    if not outputs or len(outputs) != 1:
+        raise QualityDataError(
+            f"expected one generate result, got {0 if not outputs else len(outputs)}"
+        )
+    return outputs[0]
+
+
+def evaluate_quality(llm, data: QualityData, *, output_tokens: int = 64) -> dict:
+    """Score windows and greedily complete prompts on an existing LLM."""
+    if type(output_tokens) is not int or output_tokens < 1:
+        raise QualityDataError("quality output tokens must be a positive integer")
+    prompt_ids = _encode_prompts(llm.get_tokenizer(), data.prompts)
+    failure = length_failure(
+        llm.llm_engine.model_config.max_model_len,
+        window_tokens=max(len(window) for window in data.token_windows),
+        prompt_tokens=max(len(ids) for ids in prompt_ids),
+        output_tokens=output_tokens,
+    )
+    if failure:
+        raise QualityDataError(failure)
+    from vllm import SamplingParams
+
+    generations = []
+    params = SamplingParams(temperature=0.0, max_tokens=output_tokens)
+    for index, (text, token_ids) in enumerate(zip(data.prompts, prompt_ids)):
+        output = _one_output(llm, {"prompt": text, "prompt_token_ids": token_ids}, params)
+        _require_echo(output, token_ids, f"prompt {index}")
+        if not output.outputs:
+            raise QualityDataError(f"prompt {index} returned no completion")
+        completion = output.outputs[0]
+        output_ids = completion.token_ids
+        finish = completion.finish_reason
+        n_out = len(output_ids)
+        if n_out == 0:
+            raise QualityDataError(f"prompt {index} generated no tokens")
+        if n_out > output_tokens:
+            raise QualityDataError(
+                f"prompt {index} generated {n_out} tokens, expected at most {output_tokens}"
+            )
+        if finish == "length" and n_out != output_tokens:
+            raise QualityDataError(
+                f"prompt {index} length-stopped at {n_out} tokens, expected {output_tokens}; "
+                "refusing a truncated completion"
+            )
+        if finish not in {None, "length", "stop"}:
+            raise QualityDataError(f"prompt {index} finish_reason is {finish}")
+        generations.append(
+            {
+                "prompt": text,
+                "prompt_token_ids": token_ids,
+                "output_text": completion.text,
+                "output_token_ids": output_ids,
+                "finish_reason": finish,
+            }
+        )
+    params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=0, ignore_eos=True)
+    scores = []
+    for index, window in enumerate(data.token_windows):
+        output = _one_output(llm, {"prompt_token_ids": window}, params)
+        _require_echo(output, window, f"window {index}")
+        n_out = len(output.outputs[0].token_ids) if output.outputs else 0
+        if n_out != 1:
+            raise QualityDataError(
+                f"window {index} generated {n_out} tokens, expected 1; "
+                "max_model_len may be too small to score the full window"
+            )
+        scores.append(score_window_logprobs(window, output.prompt_logprobs, index=index))
+    perplexity = aggregate_window_nlls(scores)
+    return {
+        "ran": True,
+        "kind": "held_out_window_perplexity",
+        "paper_reproduction": False,
+        "quality_threshold": None,
+        "limitation": _QUALITY_LIMITATION,
+        "dataset": data.dataset,
+        "protocol": _QUALITY_PROTOCOL,
+        "counts": {
+            "windows": len(data.token_windows),
+            "prompts": len(data.prompts),
+            "generations": len(generations),
+            "window_tokens": sum(len(window) for window in data.token_windows),
+            "predicted_tokens": perplexity["predicted_tokens"],
+            "excluded_first_tokens": len(data.token_windows),
+            "quality_output_tokens": output_tokens,
+        },
+        "perplexity": perplexity,
+        "windows": scores,
+        "generations": generations,
+    }
+
+
+def prepare_quality(args) -> None:
+    args.quality_payload = None
+    args.quality_required_len = 0
+    if not args.quality_data:
+        return
+    data = load_quality_data(args.quality_data)
+    try:
+        from vllm.tokenizers import get_tokenizer
+
+        tokenizer = get_tokenizer(args.model, trust_remote_code=args.trust_remote_code)
+    except Exception as exc:
+        raise QualityDataError(
+            f"cannot load the checkpoint tokenizer to size max_model_len: {exc}"
+        ) from exc
+    lengths = [len(ids) for ids in _encode_prompts(tokenizer, data.prompts)]
+    window_tokens = max(len(window) for window in data.token_windows)
+    prompt_tokens = max(lengths)
+    if args.max_model_len:
+        failure = length_failure(
+            args.max_model_len,
+            window_tokens=window_tokens,
+            prompt_tokens=prompt_tokens,
+            output_tokens=args.quality_output_tokens,
+        )
+        if failure:
+            raise QualityDataError(failure)
+    args.quality_payload = data
+    args.quality_required_len = max(window_tokens + 1, prompt_tokens + args.quality_output_tokens)
+
+
+def _quality_error(message: str) -> dict:
+    return {
+        "ran": False,
+        "kind": "held_out_window_perplexity",
+        "paper_reproduction": False,
+        "quality_threshold": None,
+        "error": message,
+    }
+
+
+def _quality_skipped(args, report: dict, reason: str) -> None:
+    if not getattr(args, "quality_data", None):
+        return
+    report["failures"].append(reason)
+    report["quality"] = _quality_error(reason)
+
+
+def _record_quality(args, report: dict, llm) -> None:
+    if not getattr(args, "quality_data", None):
+        return
+    data = args.quality_payload
+    print(
+        f"quality: scoring {len(data.token_windows)} windows and {len(data.prompts)} prompts "
+        "outside measured repeats",
+        file=sys.stderr,
+    )
+    try:
+        report["quality"] = evaluate_quality(
+            llm,
+            data,
+            output_tokens=args.quality_output_tokens,
+        )
+    except QualityDataError as exc:
+        report["failures"].append(str(exc))
+        report["quality"] = _quality_error(str(exc))
+        return
+    if args.activation_bits in (4, 8):
+        report["quality"]["activation"] = {
+            "bits": args.activation_bits,
+            "batch_size": args.batch_size,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "allow_fallback": False,
+            "requests": "one at a time",
+        }
+
+
 def run(args, report: dict) -> int:
     import vllm
 
     report["vllm_version"] = getattr(vllm, "__version__", "unknown")
-    if args.activation_bits == 4:
+    if args.activation_bits in (4, 8):
         time_engine(args, report, None)
     else:
         token = observe(args, report)
         if token is None:
             report["timing_skipped"] = (
                 "checkpoint shape or static Humming selection failed; timing was not started"
+            )
+            _quality_skipped(
+                args,
+                report,
+                "quality evaluation was not run because the timing engine was not started",
             )
             report["ok"] = False
             return 1
@@ -768,15 +1296,40 @@ def run(args, report: dict) -> int:
 def main() -> int:
     args = parse_args()
     ensure_import_path()
-    if args.activation_bits == 4:
+    if args.activation_bits in (4, 8):
         os.environ["VLLM_HUMMING_INPUT_QUANT_CONFIG"] = json.dumps(
-            {"dtype": "int4", "group_size": 0, "allow_fallback": False}
+            {"dtype": f"int{args.activation_bits}", "group_size": 0, "allow_fallback": False}
         )
-    report = new_report(args)
     exit_code = 1
+    report = None
     try:
-        exit_code = run(args, report)
+        shape_errors = apply_shape_expectations(args)
+        prepare_quality(args)
+        report = new_report(args)
+        if shape_errors:
+            report["failures"].extend(shape_errors)
+            report["timing_skipped"] = "checkpoint config could not supply shape checks"
+            _quality_skipped(
+                args,
+                report,
+                "quality evaluation was not run because checkpoint config could not supply shape checks",
+            )
+            report["ok"] = False
+            exit_code = 1
+        else:
+            exit_code = run(args, report)
+    except QualityDataError as exc:
+        if report is None:
+            report = new_report(args)
+        report["ok"] = False
+        report["failures"].append(str(exc))
+        report["error"] = str(exc)
+        report["quality"] = _quality_error(str(exc))
+        print(str(exc), file=sys.stderr)
+        exit_code = 1
     except Exception:
+        if report is None:
+            report = new_report(args)
         report["ok"] = False
         report["error"] = traceback.format_exc()
         print(report["error"], file=sys.stderr)

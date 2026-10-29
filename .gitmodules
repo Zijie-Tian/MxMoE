@@ -1,6 +1,7 @@
 [submodule "mxmoe/3rdparty/fast-hadamard-transform"]
 	path = mxmoe/3rdparty/fast-hadamard-transform
 	url = https://github.com/Dao-AILab/fast-hadamard-transform.git
+	ignore = untracked
 [submodule "mxmoe/kernels/src/3rdparty/fmt"]
 	path = mxmoe/kernels/src/3rdparty/fmt
 	url = https://github.com/fmtlib/fmt.git
@@ -17,3 +18,4 @@
 	path = 3rdparty/vllm
 	url = https://github.com/Zijie-Tian/vllm.git
 	branch = tzj/mxmoe
+	ignore = untracked
