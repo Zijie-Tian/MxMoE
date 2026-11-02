@@ -30,7 +30,8 @@ template <                               //
     int GSIZE_           = -1,           // `-1` represent per-channel(for weight)/per-token(for activation)
     PackDim PACK_DIM_    = PackDim::MN,  // for weight quantization, we pack along row
     bool USE_FP_         = false,        // FP8, FP4
-    typename T_SCALE_ZP_ = half          //
+    typename T_SCALE_ZP_ = half,         //
+    bool RAW_ZERO_       = false         // (q - z) * s instead of q * s + zp
     >
 struct QConfig {
   static constexpr bool IS_QUANT = true;
@@ -42,6 +43,7 @@ struct QConfig {
   static constexpr int GSIZE    = GSIZE_;
   static constexpr int PACK_NUM = sizeof(T_PACK) * 8 / QBITS;
   static constexpr bool USE_FP  = USE_FP_;
+  static constexpr bool RAW_ZERO = RAW_ZERO_;
 
   static constexpr PackDim PACK_DIM = PACK_DIM_;
 };
@@ -449,7 +451,7 @@ struct GlobalTileC {
       half* smem_scale_b,                      //
       int lane, int warp_x, int warp_y         //
   ) {
-    auto col = lane % 4;
+    auto col = 2 * (lane % 4);
     auto row = lane / 4;
 
 #pragma unroll
@@ -487,10 +489,10 @@ struct GlobalTileC {
         // __int2half_rn(frag_c[frag_off][3]) * r_sa[i * 2 + 1] * r_sb[j * 2 +
         // 1];
 
-        frag_out[frag_off][0] += T(frag_in[frag_off][0]) * T(r_sa[i * 2] * r_sb[j * 2]);
-        frag_out[frag_off][1] += T(frag_in[frag_off][1]) * T(r_sa[i * 2] * r_sb[j * 2 + 1]);
-        frag_out[frag_off][2] += T(frag_in[frag_off][2]) * T(r_sa[i * 2 + 1] * r_sb[j * 2]);
-        frag_out[frag_off][3] += T(frag_in[frag_off][3]) * T(r_sa[i * 2 + 1] * r_sb[j * 2 + 1]);
+        frag_out[frag_off][0] += T(frag_in[frag_off][0]) * T(r_sa[i * 2]) * T(r_sb[j * 2]);
+        frag_out[frag_off][1] += T(frag_in[frag_off][1]) * T(r_sa[i * 2]) * T(r_sb[j * 2 + 1]);
+        frag_out[frag_off][2] += T(frag_in[frag_off][2]) * T(r_sa[i * 2 + 1]) * T(r_sb[j * 2]);
+        frag_out[frag_off][3] += T(frag_in[frag_off][3]) * T(r_sa[i * 2 + 1]) * T(r_sb[j * 2 + 1]);
       }
     }
   }
@@ -736,7 +738,7 @@ struct QuantTileA {
   static constexpr int mmaK        = TileConfig::mmaK;
   static constexpr int WARP_TILE_M = TileConfig::WARP_TILE_M;
   static constexpr int WARP_TILE_K = TileConfig::WARP_TILE_K;
-  static constexpr int WARP_FRAG_M = TileConfig::WARP_FRAG_N;
+  static constexpr int WARP_FRAG_M = TileConfig::WARP_FRAG_M;
   static constexpr int FRAG_A_TH   = TileConfig::FRAG_A_TH;
 
   static constexpr int PACK_NUM       = QConfig::PACK_NUM;
@@ -836,7 +838,8 @@ struct QuantTileA {
         for (auto i = 0; i < CTA_SCALE_SIZE; i += CTA_SIZE) {
           auto off = i + tidx;
           if (off < CTA_SCALE_SIZE) {
-            smem[off + k * CTA_SCALE_SIZE] = gmem[off];
+            smem[off + k * CTA_SCALE_SIZE] =
+                off < cta_MAX_LOGIC_ROW ? gmem[off] : __float2half_rn(1.0f);
           }
         }
       }
@@ -966,7 +969,8 @@ struct QuantTileB {
 
   static constexpr auto dequant_frag = [] {
     if constexpr (PACK_DIM == PackDim::MN)
-      return Converter::dequant_frag<WARP_FRAG_N, PACK_NUM, FRAG_B_TH, SYM_QUANT, QBITS, SCALE_ZP_PER_TH>;
+      return Converter::dequant_frag<WARP_FRAG_N, PACK_NUM, FRAG_B_TH, SYM_QUANT, QBITS, SCALE_ZP_PER_TH,
+                                      QConfig::RAW_ZERO>;
     else
       return nullptr;
   }();

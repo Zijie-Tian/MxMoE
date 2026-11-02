@@ -181,6 +181,8 @@ conda run --no-capture-output -n mxmoe python -m pip install \
 
 安装过程需等待 `Successfully installed vllm...`，不能在编译启动或仅生成 `.so` 时宣布完成。后续增量构建参考[子模块说明](../3rdparty/vllm/docs/contributing/incremental_build.md)；生成 preset 的 Python 必须来自 `mxmoe`，否则会把错误解释器写入 CMake 配置。
 
+`3rdparty/vllm/build` 无论是生成目录还是指向外部构建缓存的软链接，都由子模块的 `.gitignore` 排除；`requirements/build/` 是源码依赖清单，仍保留版本管理。无需为了清理 Git 状态删除可复用的本地构建缓存。
+
 ## 5. 验证：区分安装、算子执行和模型推理
 
 ### 依赖及源码来源（不加载模型）
@@ -254,4 +256,4 @@ conda run --no-capture-output -n mxmoe python project_config.py --check qwen2_mo
 - vLLM：需要显存充足的 GPU，实际加载模型并用 `LLM.generate` 覆盖 prefill 和多 token decode，检查返回 token；导入成功或单个 RMSNorm 通过不等同于此项通过。
 - Performance：固定 GPU、模型、dtype、输入/输出长度、batch、warm-up、计时范围后再测吞吐/延迟。MxMoE 的 `run_mxmoe_gg.py` 是独立 GroupGEMM benchmark，不等同于 vLLM 端到端测速。
 
-`run_vllm_gptq.py` 对具体的 packed checkpoint 分别核验实际 Humming 调用和未插桩的 prefill/decode 性能；用法见根 README。测量 JSON 保留在 `out/bench/`，不将机器本地路径、安装日志或逐机实验报告写入本文。单个算子或环境检查通过不代表某个模型已通过推理验证，也不代表 MxMoE 自定义混合精度 kernel 已接入 vLLM。
+`run_vllm_gptq.py` 对具体 packed checkpoint 分别核验实际算子调用和未插桩的 prefill/decode 性能；默认 routed backend 为 Humming，`--moe-backend mxmoe` 选择 MxMoE 原生 grouped GEMM（单 GPU、FP16 接口、均匀 W2/W4/W8 非对称 g128 权重）。原生后端还可通过 vLLM `kernel_config.mxmoe_activation_config` 加载逐 layer/expert/Gate/Up/Down 的 A4/A8/A16 策略；W2/W4 支持 A4/A8/A16，W8 支持 A8/A16，A4/A8 为算子内部动态 per-token 对称量化，且配置的权重元数据必须与 checkpoint 一致。其缓存扩展在模型加载阶段使用同一 Torch/CUDA 环境编译，需 `ninja`；用法及限制见根 README。测量 JSON 保留在 `out/bench/`，不将机器本地路径、安装日志或逐机实验报告写入本文。单个算子或环境检查通过不代表模型质量、端到端性能或任意混合权重 checkpoint 已验证。

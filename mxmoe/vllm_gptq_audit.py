@@ -1,5 +1,5 @@
-"""Worker-side evidence that a compressed-tensors WkA16 model is really
-running Humming for dense linears and routed experts.
+"""Worker-side evidence of Humming dense GEMMs and the selected routed backend
+(Humming or native MxMoE) for a compressed-tensors WkA16 model.
 
 The timing process must not install forward wrappers. Both workers install the
 compressed-tensors group-size fix at import, before model load; only the eager
@@ -127,6 +127,11 @@ class _Recorder:
         self.required_moe_prefixes: list[str] = []
         self.original_dense = None
         self.original_moe = None
+        self.original_mxmoe_apply = None
+        self.original_mxmoe_gemm = None
+        self.original_mxmoe_mixed_gemm = None
+        self.mxmoe_scope = None
+        self.moe_backend = "humming"
         self.forward_tags = 0
         self.calls: dict[str, dict[str, _CallBucket]] = {}
         self.reset()
@@ -259,7 +264,7 @@ def _note_dense(layer, x) -> None:
     )
 
 
-def _note_moe(experts, sublayer_name, inputs, weight) -> None:
+def _note_moe(experts, sublayer_name, inputs, weight, kernel="humming_forward") -> None:
     if not _RECORDER.enabled:
         return
     phase, source = _current_phase()
@@ -268,7 +273,7 @@ def _note_moe(experts, sublayer_name, inputs, weight) -> None:
         prefix=str(getattr(experts, "_gptq_audit_prefix", "") or ""),
         rows=rows,
         activation_dtype=_dtype_name(inputs.dtype),
-        kernel="humming_forward",
+        kernel=kernel,
         experts_cls=type(experts).__name__,
         sublayer=str(sublayer_name),
         weight_is_floating=bool(weight is not None and weight.is_floating_point()),
@@ -276,8 +281,8 @@ def _note_moe(experts, sublayer_name, inputs, weight) -> None:
     )
 
 
-def install_backend_counters() -> None:
-    """Wrap Humming entry points. Call this before the first forward."""
+def install_backend_counters(moe_backend: str = "humming") -> None:
+    """Wrap the selected entry points before model loading; observation only."""
     if _RECORDER.installed:
         return
     import vllm.model_executor.layers.quantization.utils.humming as humming_pkg
@@ -302,6 +307,55 @@ def install_backend_counters() -> None:
     linear_mod.apply_humming_linear = apply_humming_linear
     humming_pkg.apply_humming_linear = apply_humming_linear
     HummingExpertsBase.humming_forward = humming_forward
+    _RECORDER.moe_backend = moe_backend
+    if moe_backend == "mxmoe":
+        from mxmoe.vllm import ops
+        from mxmoe.vllm.experts import MxMoEExperts
+
+        original_apply = MxMoEExperts.apply
+        original_gemm = ops.grouped_gemm_out
+        original_mixed_gemm = ops.grouped_gemm_mixed_out
+
+        def mxmoe_apply(self, *args, **kwargs):
+            if not _RECORDER.enabled:
+                return original_apply(self, *args, **kwargs)
+            previous = _RECORDER.mxmoe_scope
+            _RECORDER.mxmoe_scope = [self, 0]
+            try:
+                return original_apply(self, *args, **kwargs)
+            finally:
+                _RECORDER.mxmoe_scope = previous
+
+        def mxmoe_gemm(inputs, packed, scale_zero, offsets, bits, output, scratch):
+            result = original_gemm(inputs, packed, scale_zero, offsets, bits, output, scratch)
+            scope = _RECORDER.mxmoe_scope
+            if _RECORDER.enabled and scope is not None:
+                _note_moe(scope[0], ("w13", "w2")[scope[1]], inputs, packed, "mxmoe_grouped_gemm")
+                scope[1] += 1
+            return result
+
+        def mxmoe_mixed_gemm(
+            inputs, packed, scale_zero, offsets, bits, activation_bits,
+            packed_input, activation_scales, activation_sums, output, scratch,
+            column_start, column_count, activation_mask,
+        ):
+            result = original_mixed_gemm(
+                inputs, packed, scale_zero, offsets, bits, activation_bits,
+                packed_input, activation_scales, activation_sums, output, scratch,
+                column_start, column_count, activation_mask,
+            )
+            scope = _RECORDER.mxmoe_scope
+            if _RECORDER.enabled and scope is not None:
+                sublayer = "w13" if packed.size(1) == 2 else "w2"
+                _note_moe(scope[0], sublayer, inputs, packed, "mxmoe_grouped_gemm")
+            return result
+
+        MxMoEExperts.apply = mxmoe_apply
+        ops.grouped_gemm_out = mxmoe_gemm
+        ops.grouped_gemm_mixed_out = mxmoe_mixed_gemm
+        _RECORDER.original_mxmoe_apply = original_apply
+        _RECORDER.original_mxmoe_gemm = original_gemm
+        _RECORDER.original_mxmoe_mixed_gemm = original_mixed_gemm
     _RECORDER.original_dense = original_dense
     _RECORDER.original_moe = original_moe
     _RECORDER.installed = True
@@ -321,6 +375,16 @@ def uninstall_backend_counters() -> None:
     linear_mod.apply_humming_linear = _RECORDER.original_dense
     humming_pkg.apply_humming_linear = _RECORDER.original_dense
     HummingExpertsBase.humming_forward = _RECORDER.original_moe
+    if _RECORDER.original_mxmoe_apply is not None:
+        from mxmoe.vllm import ops
+        from mxmoe.vllm.experts import MxMoEExperts
+
+        MxMoEExperts.apply = _RECORDER.original_mxmoe_apply
+        ops.grouped_gemm_out = _RECORDER.original_mxmoe_gemm
+        ops.grouped_gemm_mixed_out = _RECORDER.original_mxmoe_mixed_gemm
+        _RECORDER.original_mxmoe_apply = None
+        _RECORDER.original_mxmoe_gemm = None
+        _RECORDER.original_mxmoe_mixed_gemm = None
     _RECORDER.installed = False
     _RECORDER.enabled = False
 
@@ -455,7 +519,7 @@ def _stamp_moe_prefix(module: Any, prefix: str) -> None:
         if fused is not None:
             objects.append(fused)
     for obj in objects:
-        if hasattr(obj, "humming_forward"):
+        if hasattr(obj, "humming_forward") or type(obj).__name__ == "MxMoEExperts":
             obj._gptq_audit_prefix = prefix
 
 
@@ -526,7 +590,7 @@ def _moe_record(prefix: str, module: Any) -> dict[str, Any]:
         "activation_dtype": None if act is None else _dtype_name(act),
         "humming_input_bits": None if not input_bits else ",".join(input_bits),
         "floating_weights": _floating_weight_names(module),
-        "static_selection": "humming" if backend == "HUMMING" else "other",
+        "static_selection": backend.lower() if backend in {"HUMMING", "MXMOE"} else "other",
     }
 
 
@@ -598,26 +662,29 @@ def _check_w2_linear(
 
 
 def _check_w2_moe(
-    record: dict[str, Any], weight_bits: int, group_size: int, failures: list[str]
+    record: dict[str, Any], weight_bits: int, group_size: int, failures: list[str],
+    moe_backend: str,
 ) -> None:
     prefix = record["prefix"]
+    expected_backend = moe_backend.upper()
+    expected_class = "MxMoE" if moe_backend == "mxmoe" else "Humming"
     if record["floating_weights"] or record["quant_method"] in {
         None,
         "UnquantizedFusedMoEMethod",
     }:
         failures.append(
             f"{prefix} routed experts are floating ({record['quant_method']}, "
-            f"weights {record['floating_weights'] or 'missing'}); expected Humming W{weight_bits}A16"
+            f"weights {record['floating_weights'] or 'missing'}); expected {moe_backend} W{weight_bits}A16"
         )
         return
-    if record["moe_backend"] != "HUMMING":
+    if record["moe_backend"] != expected_backend:
         failures.append(
-            f"{prefix} fused MoE backend is {record['moe_backend']}, expected HUMMING"
+            f"{prefix} fused MoE backend is {record['moe_backend']}, expected {expected_backend}"
         )
     experts_cls = record["experts_cls"] or ""
-    if "Humming" not in experts_cls:
+    if expected_class not in experts_cls:
         failures.append(
-            f"{prefix} experts class is {experts_cls or 'missing'}, expected Humming"
+            f"{prefix} experts class is {experts_cls or 'missing'}, expected {expected_class}"
         )
     if _as_int(record["weight_bits"]) != weight_bits:
         failures.append(
@@ -642,7 +709,7 @@ def _check_w2_moe(
 
 
 def inspect_loaded_model(
-    worker: Any, *, weight_bits: int, group_size: int
+    worker: Any, *, weight_bits: int, group_size: int, moe_backend: str = "humming"
 ) -> dict[str, Any]:
     """Classify loaded modules. This is static selection, not an observed call."""
     model = worker.model_runner.model
@@ -688,7 +755,7 @@ def inspect_loaded_model(
             required.append(record)
             expert_layers.add(layer_idx)
             _stamp_moe_prefix(module, prefix)
-            _check_w2_moe(record, weight_bits, group_size, failures)
+            _check_w2_moe(record, weight_bits, group_size, failures, moe_backend)
 
     for layer_idx in layout["dense_layers"]:
         gap = _projection_gap(dense_names.get(layer_idx, set()))
@@ -720,11 +787,11 @@ def inspect_loaded_model(
         )
 
     engine = _engine_snapshot(worker)
-    if engine["moe_backend"] != "humming" or engine["linear_backend"] != "humming":
+    if engine["moe_backend"] != moe_backend or engine["linear_backend"] != "humming":
         failures.append(
             "engine backends are "
             f"moe={engine['moe_backend']}, linear={engine['linear_backend']}; "
-            "expected humming for both"
+            f"expected moe={moe_backend}, linear=humming"
         )
     if engine["enable_prefix_caching"]:
         failures.append("prefix caching is enabled; repeated timing would reuse KV")
@@ -742,7 +809,7 @@ def inspect_loaded_model(
     return {
         "engine": engine,
         **layout,
-        "expected_humming_counts": expected_humming_counts(layout),
+        "expected_humming_counts": expected_humming_counts(layout) if moe_backend == "humming" else None,
         "required_modules": required,
         "excluded_counts": excluded_counts,
         "required_dense_prefixes": dense_prefixes,
@@ -767,17 +834,20 @@ def _observed_failures() -> list[str]:
             )
         if _RECORDER.required_moe_prefixes and missing_moe:
             failures.append(
-                f"{phase} did not call Humming MoE humming_forward for: "
+                f"{phase} did not call {_RECORDER.moe_backend} MoE GEMMs for: "
                 + ", ".join(missing_moe)
             )
         if _RECORDER.required_moe_prefixes:
+            expected_kernel = "mxmoe_grouped_gemm" if _RECORDER.moe_backend == "mxmoe" else "humming_forward"
+            if moe.kernels != {expected_kernel}:
+                failures.append(f"{phase} routed kernels were {sorted(moe.kernels)}, expected {expected_kernel}")
             for sublayer in ("w13", "w2"):
                 if moe.sublayers.get(sublayer, 0) <= 0:
-                    failures.append(f"{phase} Humming MoE did not call {sublayer}")
+                    failures.append(f"{phase} {_RECORDER.moe_backend} MoE did not call {sublayer}")
         for kind, bucket in (("dense", dense), ("moe", moe)):
             if bucket.floating_weight_calls:
                 failures.append(
-                    f"{phase} {kind} Humming call saw floating weights "
+                    f"{phase} {kind} GEMM call saw floating weights "
                     f"({bucket.floating_weight_calls} calls)"
                 )
             bad = sorted(
@@ -789,7 +859,7 @@ def _observed_failures() -> list[str]:
                 )
     if calls["unscoped"]["dense"].count or calls["unscoped"]["moe"].count:
         failures.append(
-            "Humming calls ran without a prefill/decode phase tag: "
+            "GEMM calls ran without a prefill/decode phase tag: "
             f"dense {calls['unscoped']['dense'].count}, "
             f"moe {calls['unscoped']['moe'].count}"
         )
@@ -848,8 +918,10 @@ def inspect_humming_a4(worker, weight_bits: int = 2, activation_bits: int = 4) -
 class GptqAuditExtension:
     """Methods injected into the default worker. They do not wrap kernels."""
 
-    def gptq_audit_inspect(self, weight_bits: int = 2, group_size: int = 128) -> dict:
-        return inspect_loaded_model(self, weight_bits=weight_bits, group_size=group_size)
+    def gptq_audit_inspect(self, weight_bits: int = 2, group_size: int = 128,
+                         moe_backend: str = "humming") -> dict:
+        return inspect_loaded_model(self, weight_bits=weight_bits, group_size=group_size,
+                                    moe_backend=moe_backend)
 
     def gptq_audit_inspect_a4(self, weight_bits: int = 2, activation_bits: int = 4) -> dict:
         return inspect_humming_a4(
@@ -857,7 +929,7 @@ class GptqAuditExtension:
         )
 
     def gptq_audit_begin(self, batch_size: int, prompt_len: int) -> dict:
-        install_backend_counters()
+        install_backend_counters(self.vllm_config.kernel_config.moe_backend)
         _RECORDER.begin(batch_size, prompt_len)
         model = self.model_runner.model  # type: ignore[attr-defined]
         handles = [model.register_forward_pre_hook(_model_pre_hook, with_kwargs=True)]
@@ -948,5 +1020,5 @@ class GptqAuditWorker(_gpu_worker(), GptqAuditExtension):
     """Eager observation worker. Wrappers are installed before weight load."""
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        install_backend_counters()
+        install_backend_counters(self.vllm_config.kernel_config.moe_backend)
         return super().load_model(load_dummy_weights=load_dummy_weights)

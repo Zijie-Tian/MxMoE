@@ -1,4 +1,4 @@
-"""GPTQ export, padding, quality accounting, and vLLM/Humming regressions."""
+"""GPTQ export, numerical quality, and real Humming/MxMoE regressions."""
 
 import inspect
 import json
@@ -384,3 +384,377 @@ def test_humming_real_constructor_in_fresh_process(order):
     result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],
                             capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _mxmoe_case(bits):
+    from mxmoe.vllm import ops
+    from mxmoe.quant.gptq_pack import _pack_unsigned_last_dim
+
+    generator = torch.Generator().manual_seed(821)
+    experts, n, k, group = 3, 256, 256, 128
+    codes = torch.randint(1 << bits, (experts, n, k), generator=generator, dtype=torch.int32)
+    zeros = torch.randint(1 << bits, (experts, n, k // group), generator=generator, dtype=torch.int32)
+    scales = torch.linspace(0.003, 0.021, experts * n * (k // group)).reshape(experts, n, -1) / (1 << bits)
+    group_idx = torch.arange(k) // group
+    codes[0] = zeros[0, :, group_idx]  # A whole expert is exactly zero.
+    reference = ((codes - zeros[:, :, group_idx]).half() * scales.half()[:, :, group_idx]).float()
+    qweight = _pack_unsigned_last_dim(codes, bits).cuda()
+    qzeros = _pack_unsigned_last_dim(zeros.transpose(-1, -2).contiguous(), bits).transpose(-1, -2).contiguous().cuda()
+    packed, scale_zero = ops.prepare_weights(qweight, scales.cuda(), qzeros, bits)
+    inputs = torch.randn(17, k, generator=generator).half().cuda()
+    offsets = torch.tensor([0, 5, 5, 17], dtype=torch.int64, device="cuda")
+    output = torch.empty(17, n, dtype=torch.float16, device="cuda")
+    scratch = ops.workspace(experts, inputs.device)
+    return inputs, packed, scale_zero, offsets, output, scratch, reference
+
+
+def _mxmoe_reference(inputs, reference, offsets):
+    rows = inputs.cpu().float()
+    expected = torch.empty(rows.shape[0], reference.shape[1])
+    for expert, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        expected[start:end] = rows[start:end] @ reference[expert].T
+    return expected.half()
+
+
+def _require_mxmoe_gpu():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("MxMoE native regression requires CUDA SM80+")
+
+
+@pytest.mark.parametrize("bits", [2, 4, 8])
+def test_mxmoe_packed_gemm_preserves_raw_zeros_and_empty_experts(bits):
+    _require_mxmoe_gpu()
+    from mxmoe.vllm import ops
+
+    inputs, packed, scales, offsets, output, scratch, reference = _mxmoe_case(bits)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ops.grouped_gemm_out(inputs, packed, scales, offsets, bits, output, scratch)
+    torch.cuda.current_stream().wait_stream(stream)
+    expected = _mxmoe_reference(inputs, reference, [0, 5, 5, 17])
+    torch.testing.assert_close(output.cpu(), expected, rtol=2e-3, atol=2e-4)
+    assert torch.count_nonzero(output[:5]).item() == 0
+
+
+def test_mxmoe_graph_replay_uses_current_expert_offsets():
+    _require_mxmoe_gpu()
+    from mxmoe.vllm import ops
+
+    inputs, packed, scales, offsets, output, scratch, reference = _mxmoe_case(2)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ops.grouped_gemm_out(inputs, packed, scales, offsets, 2, output, scratch)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        ops.grouped_gemm_out(inputs, packed, scales, offsets, 2, output, scratch)
+    for boundaries in ([0, 0, 7, 17], [0, 17, 17, 17]):
+        offsets.copy_(torch.tensor(boundaries, dtype=torch.int64, device=offsets.device))
+        output.fill_(float("nan"))
+        graph.replay()
+        expected = _mxmoe_reference(inputs, reference, boundaries)
+        torch.testing.assert_close(output.cpu(), expected, rtol=2e-3, atol=2e-4)
+
+
+@pytest.mark.parametrize("flags", [
+    ["--activation-bits", "4"],
+    ["--activation-bits", "8"],
+    ["--quantization", "humming"],
+])
+def test_mxmoe_runner_rejects_humming_only_precision_paths(tmp_path, monkeypatch, flags):
+    from run_vllm_gptq import parse_args
+
+    monkeypatch.setattr(sys, "argv", [
+        "run_vllm_gptq.py", str(tmp_path), "--moe-backend", "mxmoe", *flags,
+    ])
+    with pytest.raises(SystemExit) as error:
+        parse_args()
+    assert error.value.code == 2
+
+
+def _activation_qconfig(bits=4, shared=False):
+    choices = ((4, 8, 16, 4), (8, 8, 4, 16), (4, 16, 8, 8))
+    if bits == 8:
+        choices = ((8, 8, 16, 8), (8, 16, 8, 16), (8, 16, 8, 8))
+    if shared:
+        choices = (choices[0], choices[0], choices[2])
+    return {"1": {"experts": {
+        str(e): {
+            name: {"w_bits": bits, "w_gsize": 128, "w_sym": False,
+                   "a_bits": choices[p][e], "a_gsize": -1, "a_sym": True,
+                   "a_clip": [0.75, 1.0] if p == 0 or (shared and p == 1) else [1.0, 1.0]}
+            for p, name in enumerate(("gate", "up", "down"))
+        } for e in range(4)
+    }}}
+
+
+def test_mxmoe_activation_config_preserves_independent_projection_schemes(tmp_path):
+    from mxmoe.vllm.activation import load_activation_plan
+
+    path = tmp_path / "qconfig.json"
+    source = _activation_qconfig()
+    path.write_text(json.dumps(source))
+    plan = load_activation_plan(str(path), "model.layers.1.mlp.experts", 4, 4)
+    assert tuple(s.bits for s in plan.gate.schemes) == (4, 8, 16, 4)
+    assert tuple(s.bits for s in plan.up.schemes) == (8, 8, 4, 16)
+    assert tuple(s.bits for s in plan.down.schemes) == (4, 16, 8, 8)
+    assert not plan.gate_up_shared
+    # Equal bits alone do not permit reuse when clipping differs.
+    for expert in source["1"]["experts"].values():
+        expert["up"]["a_bits"] = expert["gate"]["a_bits"]
+    path.write_text(json.dumps(source))
+    assert not load_activation_plan(str(path), "model.layers.1.mlp.experts", 4, 4).gate_up_shared
+    for expert in source["1"]["experts"].values():
+        expert["up"] = deepcopy(expert["gate"])
+    path.write_text(json.dumps(source))
+    assert load_activation_plan(str(path), "model.layers.1.mlp.experts", 4, 4).gate_up_shared
+
+
+@pytest.mark.parametrize("field,value", [
+    ("a_bits", None), ("a_bits", 2), ("a_sym", False), ("a_gsize", 128),
+    ("a_clip", [0.0, 1.0]), ("a_clip", [float("nan"), 1.0]), ("w_bits", 8),
+])
+def test_mxmoe_activation_config_rejects_missing_or_incompatible_schemes(tmp_path, field, value):
+    from mxmoe.vllm.activation import load_activation_plan
+
+    source = _activation_qconfig()
+    cfg = source["1"]["experts"]["0"]["gate"]
+    if value is None:
+        del cfg[field]
+    else:
+        cfg[field] = value
+    path = tmp_path / "qconfig.json"
+    path.write_text(json.dumps(source))
+    with pytest.raises(ValueError):
+        load_activation_plan(str(path), "model.layers.1.mlp.experts", 4, 4)
+
+
+def test_mxmoe_activation_config_rejects_w8a4(tmp_path):
+    from mxmoe.vllm.activation import load_activation_plan
+
+    source = _activation_qconfig(8)
+    source["1"]["experts"]["0"]["gate"]["a_bits"] = 4
+    path = tmp_path / "qconfig.json"
+    path.write_text(json.dumps(source))
+    with pytest.raises(ValueError, match="W8A4"):
+        load_activation_plan(str(path), "model.layers.1.mlp.experts", 4, 8)
+
+
+def _decode_signed_words(words, bits):
+    unsigned = words.to(torch.int32) & 0xFFFF
+    shifts = list(range(16 - bits, -1, -bits))
+    values = torch.stack([(unsigned >> shift) & ((1 << bits) - 1) for shift in shifts], dim=-1)
+    values = values.reshape(*words.shape[:-1], -1)
+    return torch.where(values >= (1 << (bits - 1)), values - (1 << bits), values)
+
+
+def test_mxmoe_w8a8_matches_integer_group_zero_correction_oracle():
+    _require_mxmoe_gpu()
+    from mxmoe.quant.gptq_pack import _pack_unsigned_last_dim
+    from mxmoe.vllm import ops
+
+    generator = torch.Generator().manual_seed(991)
+    experts, rows, n, k, group = 3, 17, 256, 256, 128
+    codes = torch.randint(256, (experts, n, k), generator=generator, dtype=torch.int32)
+    zeros = torch.randint(256, (experts, n, k // group), generator=generator, dtype=torch.int32)
+    scales = torch.pow(2.0, -(9 + torch.arange(experts * n * 2) % 5)).reshape(experts, n, 2)
+    qweight = _pack_unsigned_last_dim(codes, 8).cuda()
+    qzeros = _pack_unsigned_last_dim(
+        zeros.transpose(-1, -2).contiguous(), 8
+    ).transpose(-1, -2).contiguous().cuda()
+    modes = torch.full((1, experts), 8, dtype=torch.int32, device="cuda")
+    packed_weight, scale_zero = ops.prepare_weights_mixed(qweight, scales.cuda(), qzeros, 8, modes)
+
+    decoded_weight = _decode_signed_words(
+        packed_weight[:, 0].view(experts, n, k // 2).cpu(), 8
+    )
+    torch.testing.assert_close(decoded_weight, codes - 128, rtol=0, atol=0)
+    torch.testing.assert_close(
+        scale_zero[:, 0, :, :, 0].cpu(), scales.half().permute(0, 2, 1),
+        rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        scale_zero[:, 0, :, :, 1].cpu(), zeros.permute(0, 2, 1).half(),
+        rtol=0, atol=0,
+    )
+
+    values = (torch.randn(rows, k, generator=generator) / 2).half()
+    values[0].zero_()
+    inputs = values.cuda()
+    offsets = torch.tensor([0, 5, 5, rows], dtype=torch.int64, device="cuda")
+    packed_input = torch.empty(rows, k // 2, dtype=torch.int16, device="cuda")
+    activation_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
+    activation_sum = torch.empty(rows, k // group, dtype=torch.int32, device="cuda")
+    clips = torch.ones(experts, 2, dtype=torch.float32, device="cuda")
+    ops.quantize_activations_out(
+        inputs, offsets, modes[0], clips, packed_input, activation_scale,
+        activation_sum, inputs, False,
+    )
+    expected_scale = values.float().abs().amax(dim=1) / 127
+    expected_scale = torch.where(expected_scale == 0, torch.ones_like(expected_scale), expected_scale)
+    activation_codes = (values.float() / expected_scale[:, None]).round().clamp(-127, 127).to(torch.int32)
+    torch.testing.assert_close(
+        _decode_signed_words(packed_input.cpu(), 8), activation_codes, rtol=0, atol=0,
+    )
+    torch.testing.assert_close(activation_scale.cpu(), expected_scale, rtol=1e-6, atol=0)
+    torch.testing.assert_close(
+        activation_sum.cpu(), activation_codes.view(rows, -1, group).sum(dim=-1).to(torch.int32),
+        rtol=0, atol=0,
+    )
+
+    output = torch.empty(rows, n, dtype=torch.float16, device="cuda")
+    ops.grouped_gemm_mixed_out(
+        inputs, packed_weight, scale_zero, offsets, 8, modes[0], packed_input,
+        activation_scale, activation_sum, output, ops.workspace(experts, "cuda"),
+        0, n, 2,
+    )
+    expected = torch.empty(rows, n)
+    group_index = torch.arange(k) // group
+    centered = codes - zeros[:, :, group_index]
+    for expert, (start, end) in enumerate(zip((0, 5, 5), (5, 5, rows))):
+        accum = torch.zeros(end - start, n)
+        for g in range(k // group):
+            dot = (
+                activation_codes[start:end, g * group:(g + 1) * group].to(torch.int64)[:, None, :]
+                * centered[expert, :, g * group:(g + 1) * group].to(torch.int64)[None, :, :]
+            ).sum(dim=-1).float()
+            accum += dot * expected_scale[start:end, None] * scales[expert, :, g].half().float()[None, :]
+        expected[start:end] = accum
+    torch.testing.assert_close(output.cpu(), expected.half(), rtol=2e-3, atol=2e-4)
+
+
+def test_mxmoe_activation_config_content_changes_kernel_hash(tmp_path):
+    from vllm.config.kernel import KernelConfig
+
+    path = tmp_path / "qconfig.json"
+    path.write_text('{\"a_bits\":4}')
+    config = KernelConfig(moe_backend="mxmoe", mxmoe_activation_config=str(path))
+    first = config.compute_hash()
+    path.write_text('{\"a_bits\":8}')
+    assert config.compute_hash() != first
+
+
+def _mixed_weight_case(bits, n, k, generator):
+    from mxmoe.quant.gptq_pack import _pack_unsigned_last_dim
+
+    codes = torch.randint(1 << bits, (4, n, k), generator=generator, dtype=torch.int32)
+    zeros = torch.randint(1 << bits, (4, n, k // 128), generator=generator, dtype=torch.int32)
+    # Exact power-of-two scales isolate integer/zero correction from A16 weight
+    # rounding, and vary across both channels and weight groups.
+    scales = torch.pow(2.0, -(10 + torch.arange(4 * n * (k // 128)) % 4)).reshape(4, n, -1)
+    groups = torch.arange(k) // 128
+    reference = (codes - zeros[:, :, groups]).float() * scales[:, :, groups]
+    qw = _pack_unsigned_last_dim(codes, bits).cuda()
+    qz = _pack_unsigned_last_dim(zeros.transpose(-1, -2).contiguous(), bits).transpose(-1, -2).contiguous().cuda()
+    return qw, scales.cuda(), qz, reference
+
+
+def _activation_reference(values, scheme):
+    values = values.float()
+    if scheme.bits == 16:
+        return values
+    lower = (-values.amin(dim=-1, keepdim=True)).clamp_min(0) * scheme.clip[0]
+    upper = values.amax(dim=-1, keepdim=True).clamp_min(0) * scheme.clip[1]
+    qmax = (1 << (scheme.bits - 1)) - 1
+    scales = torch.maximum(lower, upper) / qmax
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+    return (values / scales).round().clamp(-qmax, qmax) * scales
+
+
+@pytest.mark.parametrize("bits,shared", [(2, False), (4, False), (4, True), (8, False)])
+def test_mxmoe_internal_mixed_activations_with_routing_graph_replay(tmp_path, monkeypatch, bits, shared):
+    _require_mxmoe_gpu()
+    from mxmoe.vllm import ops
+    from mxmoe.vllm.activation import load_activation_plan
+    from mxmoe.vllm.experts import MxMoEExperts, make_mxmoe_moe_quant_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig, RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import get_moe_permute_scratch
+    from vllm.v1.worker import workspace
+
+    monkeypatch.setattr(workspace, "_manager", None)
+    workspace.init_workspace_manager(torch.device("cuda", torch.cuda.current_device()))
+    path = tmp_path / "qconfig.json"
+    path.write_text(json.dumps(_activation_qconfig(bits, shared)))
+    plan = load_activation_plan(str(path), "model.layers.1.mlp.experts", 4, bits)
+    assert plan.gate_up_shared == shared
+    device_plan = plan.to_device("cuda")
+    generator = torch.Generator().manual_seed(281)
+    qw1, s1, z1, ref1 = _mixed_weight_case(bits, 512, 256, generator)
+    qw2, s2, z2, ref2 = _mixed_weight_case(bits, 256, 256, generator)
+    w1, sz1 = ops.prepare_weights_mixed(qw1, s1, z1, bits, device_plan.bits[:2])
+    w2, sz2 = ops.prepare_weights_mixed(qw2, s2, z2, bits, device_plan.bits[2:3])
+    config = FusedMoEConfig(
+        num_experts=4, experts_per_token=2, hidden_dim=256, intermediate_size=256,
+        num_local_experts=4, num_logical_experts=4,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=MoEActivation.SILU, in_dtype=torch.float16, device="cuda",
+        routing_method=RoutingMethodType.Renormalize, moe_backend="mxmoe",
+    )
+    method = MxMoEExperts(config, make_mxmoe_moe_quant_config(sz1, sz2, bits, 128, device_plan))
+    x_cpu = (torch.randn(65, 256, generator=generator) / 2).half()
+    x_cpu[:2].zero_()
+    x = x_cpu.cuda()
+    ids_cpu = torch.tensor([[0, 2], [2, 3], [3, 0]])[torch.arange(65) % 3]
+    ids = ids_cpu.cuda()
+    routing = torch.tensor([0.375, 0.625], device="cuda").expand(65, 2).contiguous()
+    shapes = method.workspace_shapes(65, 512, 256, 2, 4, 4, None, MoEActivation.SILU)
+    ws13, ws2, output = [torch.empty(shape, device="cuda", dtype=torch.float16) for shape in shapes]
+    # Prepare the execution-slot scratch outside graph capture.
+    get_moe_permute_scratch(num_experts=4, num_local_experts=4, device=torch.device("cuda"))
+
+    def run():
+        method.apply(output, x, w1, w2, routing, ids, MoEActivation.SILU,
+                     4, None, None, None, ws13, ws2, None, False)
+
+    def reference(selected):
+        result = torch.zeros(65, 256)
+        for expert in range(4):
+            rows, slots = (selected == expert).nonzero(as_tuple=True)
+            if rows.numel() == 0:
+                continue
+            gate = (_activation_reference(x_cpu[rows], plan.gate.schemes[expert]) @ ref1[expert, :256].T).half()
+            up = (_activation_reference(x_cpu[rows], plan.up.schemes[expert]) @ ref1[expert, 256:].T).half()
+            mid = (torch.nn.functional.silu(gate.float()).half().float() * up.float()).half()
+            down = (_activation_reference(mid, plan.down.schemes[expert]) @ ref2[expert].T).half()
+            result.index_add_(0, rows, down.float() * torch.tensor([0.375, 0.625])[slots, None])
+        return result.half()
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    stream.synchronize()
+    rtol, atol = (5e-3, 2e-3) if bits == 8 else (3e-3, 3e-5)
+    torch.testing.assert_close(output.cpu(), reference(ids_cpu), rtol=rtol, atol=atol)
+    assert torch.count_nonzero(output[:2]).item() == 0
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    # Change previously empty experts and force 65-row/tail cases on replay.
+    for selected in (torch.tensor([1, 2]).expand(65, 2), torch.tensor([0, 3]).expand(65, 2)):
+        ids.copy_(selected)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(output.cpu(), reference(selected), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("backend,quantization,pipeline_size,policy", [
+    ("MXMOE", "humming", 1, None),
+    ("mxmoe", "compressed-tensors", 2, None),
+    ("humming", "compressed-tensors", 1, "activation.json"),
+])
+def test_mxmoe_kernel_config_rejects_unsafe_deployment(backend, quantization, pipeline_size, policy):
+    from vllm.config.kernel import KernelConfig
+
+    config = KernelConfig(moe_backend="auto", mxmoe_activation_config=policy)
+    # EngineArgs can override fields after dataclass validation.
+    config.moe_backend = backend
+    runtime = NS(
+        model_config=NS(quantization=quantization, architectures=["DeepseekV2ForCausalLM"]),
+        parallel_config=NS(pipeline_parallel_size=pipeline_size),
+    )
+    with pytest.raises(ValueError):
+        config.set_platform_defaults(runtime)

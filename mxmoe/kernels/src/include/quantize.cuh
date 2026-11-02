@@ -1,13 +1,17 @@
 #pragma once
 #include <cuda_fp16.h>
+#ifndef MXMOE_DEVICE_ONLY
 #include <thrust/host_vector.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
 
 #include "cuda_utils.cuh"
 
+#ifndef MXMOE_DEVICE_ONLY
 using thrust::host_vector;
+#endif
 
 namespace mxmoe {
 
@@ -131,7 +135,8 @@ struct Converter {
   }
 
   /// dequant `1` 16x8 fragB to `PACK_NUM` 16x8 fragB
-  template <int WARP_FRAG_N, int PACK_NUM, int ELE_PER_TH, bool SYM_QUANT, int QBITS, int SCALE_ZP_SIZE>
+  template <int WARP_FRAG_N, int PACK_NUM, int ELE_PER_TH, bool SYM_QUANT, int QBITS, int SCALE_ZP_SIZE,
+            bool RAW_ZERO = false>
   static __device__ __forceinline__ void dequant_frag(              //
       uint32_t dequant[WARP_FRAG_N][ELE_PER_TH],                    //
       const uint32_t (&qfrag)[WARP_FRAG_N / PACK_NUM][ELE_PER_TH],  //
@@ -183,11 +188,17 @@ struct Converter {
         // }
         // __syncthreads();
 
-        // scale and zp
+        // Default is q*s+zp. RAW_ZERO is (q-z)*s: q and z are exact in half, so q==z stays 0.
 #pragma unroll
         for (auto x = 0; x < ELE_PER_TH; x++) {
-          reinterpret_cast<half2&>(dequant[j + i][x]) =
-              __hfma2(reinterpret_cast<half2&>(dequant[j + i][x]), half2(scale, scale), half2(zp, zp));
+          if constexpr (RAW_ZERO && !SYM_QUANT) {
+            half2 q = reinterpret_cast<half2&>(dequant[j + i][x]);
+            half2 diff = __hsub2(q, half2(zp, zp));
+            reinterpret_cast<half2&>(dequant[j + i][x]) = __hmul2(diff, half2(scale, scale));
+          } else {
+            reinterpret_cast<half2&>(dequant[j + i][x]) =
+                __hfma2(reinterpret_cast<half2&>(dequant[j + i][x]), half2(scale, scale), half2(zp, zp));
+          }
         }
 
         // __syncthreads();
@@ -295,6 +306,7 @@ __host__ __device__ void compose_perm_indices(const int* proj, const int* desire
   }
 }
 
+#ifndef MXMOE_DEVICE_ONLY
 // assume K % gsize == 0
 inline auto permute_scale(const host_vector<half>& scale, int N, int K, int gsize, int qbits, bool sym) {
   host_vector<half> res(scale.size());
@@ -473,3 +485,4 @@ inline auto pack_wxax(               //
 
   return std::make_tuple(std::move(pack_act), std::move(pack_weight));
 }
+#endif  // MXMOE_DEVICE_ONLY

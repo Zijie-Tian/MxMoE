@@ -133,8 +133,8 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
 ```
 
 For W4/W8 exports, set both export `--wbits` and runner `--weight-bits`.
-The A16 runner observes real Humming calls in a separate eager engine, then
-times an uninstrumented engine. Prefill/decode/TPOT/TTFT are request-phase
+The A16 runner observes real calls to the selected backend in a separate eager
+engine, then times an uninstrumented engine. Prefill/decode/TPOT/TTFT are request-phase
 intervals, not isolated CUDA kernel timings. Prefix caching is disabled;
 multi-request batches use a scheduler barrier. The W4/W8 Humming group-size
 fix is installed by `mxmoe/vllm_gptq_audit.py` before worker model loading,
@@ -146,6 +146,70 @@ check rather than the A16 observation pass; activation fallback is forbidden.
 Only quantized MLPs use dynamic per-token activations; attention stays floating.
 Humming rejects same-width integer weights with zero points, so the current
 asymmetric W4A4/W8A8 checkpoints cannot use those activation modes.
+
+#### Native mxMoE backend
+
+`--moe-backend mxmoe` selects real MxMoE grouped GEMMs for routed experts;
+dense and shared-expert linears still use Humming. The integration lives in
+[`mxmoe/vllm/`](mxmoe/vllm/), with small registration hooks in the local vLLM
+submodule. Run from this repository, or make it importable via `PYTHONPATH`.
+Deployment checks and activation-config hashing stay in that native package;
+the vLLM fork retains only selection and checkpoint-adapter hooks.
+This is an explicit backend choice; `auto` priorities are unchanged.
+See [the complete usage guide](docs/vllm-mxmoe.md) for checkpoint preparation,
+per-projection activation policies, runnable inference examples and limitations.
+
+Supported: CUDA SM80+, FP16 operator input/output, uniform asymmetric W2/W4/W8
+group128 checkpoint weights, one GPU (TP/PP/DP=1, EP off), gated SiLU, and
+optional routed-expert A4/A8/A16 selected independently for every
+layer/expert/Gate/Up/Down. W2/W4 support A4, A8, and A16; W8 supports A8/A16
+(W8A4 is rejected). Hidden and expert intermediate dimensions must be divisible
+by 128. BF16 interfaces, act-order, LoRA, EPLB, and expert bias are rejected
+rather than falling back.
+
+Set `kernel_config.mxmoe_activation_config` to an MxMoE qconfig JSON. Every
+routed projection must explicitly provide weight and activation metadata; weight
+bits/group/symmetry must match the loaded checkpoint. A4/A8 is symmetric
+dynamic per-token with its configured negative/positive clipping factors.
+Gate and Up reuse one prepared input only when their complete schemes match;
+otherwise both are generated from the original FP16 input. Down preparation
+fuses SiLU×Up and quantization. Low-bit paths use real S4/S8 tensor-core GEMMs;
+they do not dequantize the activation back to FP16.
+
+The first load builds a cached extension with the shared `mxmoe` Torch/CUDA
+stack and `ninja`; no build runs inside forward. `TORCH_EXTENSIONS_DIR` can
+select a local build-cache directory. CT codes are GPU-repacked without
+requantization; raw zeros retain `(q-z)*s` semantics. Forward uses the current
+CUDA stream and GPU routing metadata with reusable, execution-slot-local scratch.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n mxmoe \
+  python run_vllm_gptq.py outputs/ds2-gptq-w2-g128-asym-ct-padffn \
+  --moe-backend mxmoe --dtype half --trust-remote-code \
+  --prompt-len 16 --output-tokens 4 --max-model-len 64 \
+  --warmup 0 --repeats 1 --output out/bench/mxmoe-smoke.json
+```
+
+Mixed-activation API example (the global `--activation-bits` runner flag remains
+the Humming uniform mode and is not the per-projection MxMoE policy):
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="/path/to/compressed-tensors-checkpoint",
+    quantization="compressed-tensors",
+    dtype="half",
+    moe_backend="mxmoe",
+    linear_backend="humming",
+    kernel_config={"mxmoe_activation_config": "/path/to/effective_qconfig.json"},
+)
+```
+
+On a shared GPU, lower `--gpu-memory-utilization` to fit the available memory.
+The observation report must identify `MxMoEExperts` and record both `w13` and
+`w2` native GEMM calls during prefill and decode. This short run is dispatch
+verification, not a model-quality or performance result.
 
 #### Held-out quality
 
@@ -191,7 +255,10 @@ natural prompt plus its completion. JSON records counts, per-window NLL,
 aggregate PPL, and generated text; execution success is not a quality threshold.
 
 All regression checks live in `tests/test_vllm_gptq.py`: packing/quality logic
-runs on CPU; Humming initialization requires CUDA SM75+ and Humming, or is skipped.
+runs on CPU; Humming initialization requires CUDA SM75+ and Humming. Native
+MxMoE tests require SM80+ and the build toolchain, covering W2/W4/W8 numerics,
+raw-zero preservation, empty experts, non-default streams, and graph replay
+with changing expert offsets. GPU cases are skipped when the hardware is absent.
 
 ```bash
 conda run --no-capture-output -n mxmoe python -m pytest -q tests/test_vllm_gptq.py

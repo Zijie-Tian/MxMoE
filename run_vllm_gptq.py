@@ -3,10 +3,10 @@
 
 Supported checkpoints are padded DeepSeek-V2-Lite and Qwen1.5-MoE-A2.7B
 (``qwen2_moe``). The checkpoint is weight-only (A16), group size 128,
-asymmetric. Supported weight widths are 2, 4, and 8. This script
-forces Humming for the quantized dense linears, shared experts, and routed
-experts, disables prefix caching, and keeps tensor parallel size 1 unless
-overridden.
+asymmetric. Supported weight widths are 2, 4, and 8. Dense linears and shared
+experts use Humming. ``--moe-backend mxmoe`` selects native MxMoE for routed
+experts (FP16, A16, group128, TP1); the default routed backend is Humming.
+Prefix caching is disabled.
 
 ``--activation-bits 4`` or ``8`` reuses the same packed weights, applies dynamic
 per-token INT4 or INT8 activation quantization through Humming, and disables
@@ -15,9 +15,9 @@ configuration, without running the separate A16-only observation pass.
 
 The default A16 mode loads two engines:
 
-1. Eager observation engine. It wraps ``apply_humming_linear`` and
-   ``HummingExpertsBase.humming_forward`` before weight load, then runs a
-   short generation. Counters record real calls for prefill and decode.
+1. Eager observation engine. It wraps the selected GEMM entry points before
+   weight load, then runs a short generation. Counters record real dense and
+   routed-expert calls for prefill and decode.
 2. Timing engine. It does not install those wrappers. Whole-generation wall
    time is reported separately from the engine phase intervals below.
 
@@ -147,6 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-bits", type=int, default=2)
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--activation-bits", type=int, choices=[4, 8, 16], default=16)
+    parser.add_argument("--moe-backend", type=str.lower, choices=["humming", "mxmoe"], default="humming")
     parser.add_argument(
         "--quantization",
         default="compressed-tensors",
@@ -191,6 +192,10 @@ def parse_args() -> argparse.Namespace:
         help="Greedy completion length for each natural prompt. Default 64.",
     )
     args = parser.parse_args()
+    if args.moe_backend == "mxmoe" and (
+        args.activation_bits != 16 or args.quantization != "compressed-tensors"
+    ):
+        parser.error("mxmoe requires --activation-bits 16 and --quantization compressed-tensors")
     if args.activation_bits in (4, 8):
         args.quantization = "humming"
     if args.prompt_len < 2:
@@ -368,7 +373,7 @@ def build_llm(args, *, enforce_eager: bool, worker_cls: str | None, worker_exten
     kwargs = {
         "model": args.model,
         "quantization": args.quantization,
-        "moe_backend": "humming",
+        "moe_backend": args.moe_backend,
         "linear_backend": "humming",
         "tensor_parallel_size": args.tensor_parallel_size,
         "enable_prefix_caching": False,
@@ -628,7 +633,7 @@ def new_report(args) -> dict:
             "observation_output_tokens": args.observation_output_tokens,
             "smoke_output_tokens": min(args.smoke_output_tokens, args.output_tokens),
             "quantization": args.quantization,
-            "moe_backend": "humming",
+            "moe_backend": args.moe_backend,
             "linear_backend": "humming",
             "tensor_parallel_size": args.tensor_parallel_size,
             "enable_prefix_caching": False,
@@ -682,6 +687,7 @@ def observe(args, report: dict) -> tuple[int, str] | None:
             "gptq_audit_inspect",
             weight_bits=args.weight_bits,
             group_size=args.group_size,
+            moe_backend=args.moe_backend,
         )
         report["static_selection_observation"] = static_reports
         failures.extend(merged_failures(static_reports))
@@ -716,7 +722,7 @@ def observe(args, report: dict) -> tuple[int, str] | None:
             "wall_generate_s": wall_s,
             "requests": records,
             "note": (
-                "Eager generate used only to observe Humming calls. "
+                "Eager generate used only to observe the selected backend calls. "
                 "Its wall time is not the performance result."
             ),
         }
@@ -754,6 +760,7 @@ def time_engine(args, report: dict, token_id: int | None) -> None:
             static_reports = rpc_all(
                 llm, "gptq_audit_inspect", weight_bits=args.weight_bits,
                 group_size=args.group_size,
+                moe_backend=args.moe_backend,
             )
         report["static_selection_timing"] = static_reports
         static_failures = merged_failures(static_reports)
@@ -762,13 +769,13 @@ def time_engine(args, report: dict, token_id: int | None) -> None:
             if shape_errors and static_failures:
                 reason = (
                     "loaded config shape does not match expectations; "
-                    f"timing engine did not select the Humming W{args.weight_bits}A{args.activation_bits} path"
+                    f"timing engine did not select the {args.moe_backend} W{args.weight_bits}A{args.activation_bits} path"
                 )
             elif shape_errors:
                 reason = "loaded config shape does not match expectations"
             else:
                 reason = (
-                    f"timing engine did not select the Humming W{args.weight_bits}A{args.activation_bits} path"
+                    f"timing engine did not select the {args.moe_backend} W{args.weight_bits}A{args.activation_bits} path"
                 )
             report["timing_skipped"] = reason
             _quality_skipped(args, report, "quality evaluation was not run because " + reason)
@@ -1279,7 +1286,7 @@ def run(args, report: dict) -> int:
         token = observe(args, report)
         if token is None:
             report["timing_skipped"] = (
-                "checkpoint shape or static Humming selection failed; timing was not started"
+                "checkpoint shape or static backend selection failed; timing was not started"
             )
             _quality_skipped(
                 args,

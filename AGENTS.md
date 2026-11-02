@@ -26,6 +26,12 @@ Model checkpoint paths are **machine-local** and live in the **gitignored** `<re
 
 Keys: `MXMOE_MODEL_DS2`, `MXMOE_MODEL_MIXTRAL`, `MXMOE_MODEL_QWEN2_MOE`, `MXMOE_MODEL_QWEN2_MOE_57B` (mapping: `MODEL_ID2ENV` in `project_config.py`). Adding a new model id ⇒ extend `MODEL_ID2ENV` + `.env.example` + this list. Requires `python-dotenv` in the `mxmoe` env.
 
+The vLLM usage examples also read optional local paths `MXMOE_DS2_W4_CT`
+(exported CT checkpoint) and `MXMOE_ACTIVATION_CONFIG` (activation policy).
+These are not model IDs accepted by `project_config.py --check`; validate the
+exported checkpoint and policy files separately as described in
+[`docs/vllm-mxmoe.md`](docs/vllm-mxmoe.md).
+
 ## Workflows (`.grok/workflows/`)
 
 Project workflows are **Rhai orchestration scripts** under `.grok/workflows/`. They automate shared-environment bring-up, extension builds, smoke verification, and later experiments. They are **not** part of the scientific code path; all use the same `mxmoe` environment documented above.
@@ -108,14 +114,15 @@ Uniform **weight-only GPTQ** on MoE expert linears (`gate` / `up` / `down` + sha
 | Export root (large HF dumps) | Default **`/mnt/raid/tzj/mxmoe/exported_hf_models/<name>/`**; override with env `MXMOE_EXPORT_HF_ROOT` or `--save` / `--save-name` |
 | Remote-code copy for HF reload | After `save_pretrained`, copies `*.py` from the source checkpoint (e.g. `modeling_deepseek.py`) so `trust_remote_code` loads |
 
-### Two export formats
+### Export formats
 
 | `--export-format` | Meaning | Bits | Load path |
 |-------------------|---------|------|-----------|
 | **`hf_float`** (default) | GPTQ-optimized **fake-quant float** weights; full HF `save_pretrained` tree | **1, 2, 3, 4, 8** | `AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)` |
 | **`gptq_pack`** | Packed **AutoGPTQ/v1** tensors (`qweight` / `qzeros` / `scales` / `g_idx`) in state_dict / safetensors | **2, 3, 4, 8 only** (W1 → `NotImplementedError`) | Needs a GPTQ backend (e.g. gptqmodel); **not** fully validated end-to-end in-repo |
+| **`compressed_tensors`** | Packed CT `weight_packed` / `weight_scale` / `weight_zero_point` / `weight_shape` tensors | **2, 4, 8** | Local vLLM Humming or native MxMoE; native MxMoE requires asymmetric group128 weights |
 
-Also written: `quantize_config.json`, `mxmoe_export_meta.json`, optional `eval_ppl.json` when `--eval-ppl`.
+Also written: `quantize_config.json`, `mxmoe_export_meta.json`; exporter `--eval-ppl` currently requires `hf_float`. For CT checkpoints use a separate vLLM quality evaluation.
 
 ### Explicitly **not** implemented (raise `NotImplementedError`)
 
@@ -124,6 +131,7 @@ Also written: `quantize_config.json`, `mxmoe_export_meta.json`, optional `eval_p
 - **Online** Hadamard (`--online-had`); offline `--hadamard` is allowed for research but changes rotation/fuse story
 - `--quant-attn` (attention GPTQ export)
 - `gptq_pack` for **W1**
+- `compressed_tensors` with W1/W3, Hadamard, act-order/dynamic groups, or partial-layer export
 
 ### Usage (conda env `mxmoe`)
 
@@ -178,6 +186,74 @@ Artifacts (gitignored large dumps): under `MXMOE_EXPORT_HF_ROOT` / default RAID 
 - Prefer **`hf_float`** for accuracy / reloadability; use **`gptq_pack`** only when a packed GPTQ consumer is required and bits ∈ {2,3,4,8}.
 - Large exports belong on **RAID** (`/mnt/raid/tzj/...`), not `/mnt/data` (often full).
 - Do not bake machine-local export paths into tracked code defaults beyond the documented RAID default; operators may override with `MXMOE_EXPORT_HF_ROOT`.
+
+## Native MxMoE in vLLM — basic usage
+
+Detailed instructions, complete mixed-activation examples and troubleshooting:
+**[`docs/vllm-mxmoe.md`](docs/vllm-mxmoe.md)**. Installation remains in
+[`doc/environment.md`](doc/environment.md); do not create another environment.
+
+### Preconditions and scope
+
+- Use the local editable vLLM submodule and run from the repository root.
+- Native code and deployment policy live in `mxmoe/vllm/`; vLLM contains only the required backend/config/checkpoint hooks. `auto` does not select MxMoE.
+- Use CUDA SM80+, `dtype=half`, one GPU (TP/PP/DP=1, EP off), gated SiLU, and hidden/expert intermediate sizes divisible by 128.
+- Checkpoint format must be **`compressed-tensors`**, with uniform asymmetric W2/W4/W8 group128 weights. `hf_float` fake-quant weights and the separate `gptq_pack` layout are not interchangeable with CT.
+- The native backend handles **routed experts**. Dense/shared-expert linears retain their selected linear backend and checkpoint precision; `moe_backend=mxmoe` does not make all other layers FP16.
+
+### A16 smoke / benchmark runner
+
+Set `MXMOE_MODEL_DS2` and `MXMOE_DS2_W4_CT` in the gitignored `.env` first.
+The latter must point to an existing complete W4 CT export. After initializing
+Conda as described in the environment guide:
+
+```bash
+conda activate mxmoe
+python project_config.py --check ds2
+CKPT="$(python -c 'import os, project_config; print(os.path.expanduser(os.environ["MXMOE_DS2_W4_CT"]))')"
+CUDA_VISIBLE_DEVICES=1 python run_vllm_gptq.py "$CKPT" \
+  --moe-backend mxmoe --quantization compressed-tensors \
+  --weight-bits 4 --activation-bits 16 --dtype half --trust-remote-code \
+  --prompt-len 16 --output-tokens 4 --max-model-len 64 \
+  --warmup 0 --repeats 1 --gpu-memory-utilization 0.65 \
+  --output out/bench/mxmoe-a16-smoke.json
+```
+
+`--weight-bits` must match the checkpoint; it is not a conversion flag. This
+runner's native mode uses A16. Its `--activation-bits 4/8` flags select Humming
+uniform activation quantization and must not be used to request native MxMoE.
+
+### Internal mixed activation
+
+Use the vLLM `LLM` API with `moe_backend="mxmoe"`,
+`quantization="compressed-tensors"`, `dtype="half"`, `linear_backend="humming"`,
+and `kernel_config={"mxmoe_activation_config": policy_path}`. The detailed guide
+contains the complete runnable example; `policy_path` comes from
+`MXMOE_ACTIVATION_CONFIG` in `.env`.
+
+- Omitted policy means unchanged A16. The JSON uses the existing MxMoE layer/expert/`gate`/`up`/`down` schema, with explicit `w_bits`, `w_gsize`, `w_sym`, `a_bits`, `a_gsize`, `a_sym`, `a_clip`.
+- W2/W4 support A4/A8/A16; W8 supports A8/A16, not A4. Low-bit activations require `a_sym=true`, `a_gsize=-1`, and two finite clipping factors in `(0, 1]`.
+- Gate/Up precision and clipping may differ. Matching schemes reuse the prepared input; Down quantization is fused with SiLU×Up. The interface stays FP16 and GEMM uses native integer math, not QDQ-to-FP16 emulation.
+- Weight metadata must match the loaded checkpoint. Do not alter config weight fields merely to bypass a mismatch; this feature does not export mixed-weight checkpoints or change checkpoint weight precision.
+- Policy contents participate in the compile hash; changing the policy requires a new engine. Forward does not reload JSON.
+
+### Verification and repository hygiene
+
+```bash
+conda activate mxmoe
+CUDA_VISIBLE_DEVICES=1 python -m pytest -q tests/test_vllm_gptq.py
+```
+
+Keep regression coverage in the existing test file. Also exercise real
+`LLM.generate`; compilation/import success is not inference validation.
+Report throughput, PPL and output-quality checks separately. Mixed policies
+generated for smoke testing are not calibrated accuracy/performance policies.
+
+Keep checkpoints, generated policies, logs and measurements in ignored locations
+such as `.env`, `outputs/` and `out/`. The vLLM root `build` directory **or symlink**
+is ignored; `requirements/build/` remains source. Publish the submodule commit
+first, then commit/push the outer repository's updated gitlink so a fresh clone
+can fetch both revisions.
 
 ## Related conventions
 
